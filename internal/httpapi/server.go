@@ -1,0 +1,606 @@
+package httpapi
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/rinat1313/zakupki-core/internal/analizator"
+	"github.com/rinat1313/zakupki-core/internal/store"
+	"github.com/rinat1313/zakupki-core/internal/ingest"
+
+	"github.com/google/uuid"
+)
+
+type Server struct {
+	Store      *store.Store
+	Analizator *analizator.Client
+	Mux        *http.ServeMux
+}
+
+func New(st *store.Store, az *analizator.Client) *Server {
+	s := &Server{Store: st, Analizator: az, Mux: http.NewServeMux()}
+	s.routes()
+	return s
+}
+
+func (s *Server) routes() {
+	s.Mux.HandleFunc("GET /api/v1/health", s.health)
+	s.Mux.HandleFunc("GET /api/v1/categories", s.listCategories)
+	s.Mux.HandleFunc("POST /api/v1/categories", s.createCategory)
+	s.Mux.HandleFunc("GET /api/v1/categories/{slug}", s.getCategory)
+	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/tenders", s.clearCategoryTenders)
+	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/jobs", s.clearCategoryJobs)
+	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/refresh", s.refreshCategory)
+
+	s.Mux.HandleFunc("POST /api/v1/ingest", s.ingest)
+	s.Mux.HandleFunc("GET /api/v1/ingest/jobs", s.listJobs)
+	s.Mux.HandleFunc("GET /api/v1/ingest/jobs/{id}", s.getJob)
+	s.Mux.HandleFunc("GET /api/v1/ingest/jobs/{id}/logs", s.jobLogs)
+	s.Mux.HandleFunc("DELETE /api/v1/ingest/jobs/{id}", s.deleteJob)
+	s.Mux.HandleFunc("GET /api/v1/stats/ingest", s.ingestStats)
+
+	s.Mux.HandleFunc("GET /api/v1/tenders", s.listTenders)
+	s.Mux.HandleFunc("GET /api/v1/tenders/{id}", s.getTender)
+	s.Mux.HandleFunc("PATCH /api/v1/tenders/{id}", s.patchTender)
+	s.Mux.HandleFunc("DELETE /api/v1/tenders/{id}", s.deleteTender)
+	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/refresh", s.refreshTender)
+	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/documents", s.listDocuments)
+	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/events", s.listEvents)
+	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/assessment", s.getAssessment)
+	s.Mux.HandleFunc("PUT /api/v1/tenders/{id}/assessment", s.putAssessment)
+	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/analyze", s.analyzeTender)
+
+	s.Mux.HandleFunc("GET /api/v1/customers", s.listCustomers)
+	s.Mux.HandleFunc("GET /api/v1/customers/{id}", s.getCustomer)
+	s.Mux.HandleFunc("POST /api/v1/customers", s.createCustomer)
+	s.Mux.HandleFunc("PATCH /api/v1/customers/{id}", s.patchCustomer)
+	s.Mux.HandleFunc("DELETE /api/v1/customers/{id}", s.deleteCustomer)
+
+	s.Mux.HandleFunc("GET /api/v1/customers/{id}/courts", s.stubList)
+	s.Mux.HandleFunc("GET /api/v1/customers/{id}/rnp", s.stubList)
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"status": "ok"}
+	if s.Analizator != nil && s.Analizator.Enabled() {
+		out["analizator_url"] = s.Analizator.BaseURL
+		if err := s.Analizator.Ping(r.Context()); err != nil {
+			out["analizator"] = "unavailable"
+			out["analizator_error"] = err.Error()
+		} else {
+			out["analizator"] = "ok"
+		}
+	} else {
+		out["analizator"] = "disabled"
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
+	list, err := s.Store.ListCategories(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(list))
+}
+
+func (s *Server) createCategory(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Title string `json:"title"`
+		Slug  string `json:"slug"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	c, err := s.Store.CreateCategory(r.Context(), body.Title, body.Slug)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, c)
+}
+
+func (s *Server) getCategory(w http.ResponseWriter, r *http.Request) {
+	c, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeErr(w, err)
+		return
+	}
+	slug := strings.TrimSpace(r.FormValue("category_slug"))
+	title := strings.TrimSpace(r.FormValue("category_title"))
+	if slug == "" && title == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "category_slug or category_title required"})
+		return
+	}
+	file, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	defer file.Close()
+	items, err := ingest.ParseCSV(file)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	name := ""
+	if hdr != nil {
+		name = hdr.Filename
+	}
+	job, err := ingest.StartIngest(r.Context(), s.Store, slug, title, name, items)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	list, err := s.Store.ListJobs(r.Context(), 100)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(list))
+}
+
+func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	job, items, err := s.Store.GetJob(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": job, "items": emptySlice(items)})
+}
+
+func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	after := int64(0)
+	if v := r.URL.Query().Get("after"); v != "" {
+		fmt.Sscanf(v, "%d", &after)
+	}
+	logs, err := s.Store.ListJobLogs(r.Context(), id, after, 300)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(logs))
+}
+
+func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.Store.DeleteJob(r.Context(), id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) clearCategoryTenders(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	n, err := s.Store.ClearCategoryTenders(r.Context(), cat.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+}
+
+func (s *Server) clearCategoryJobs(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	n, err := s.Store.DeleteJobsByCategory(r.Context(), cat.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+}
+
+func (s *Server) refreshCategory(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		Statuses  []string    `json:"statuses"`
+		TenderIDs []uuid.UUID `json:"tender_ids"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	job, err := s.Store.EnqueueRefresh(r.Context(), cat.ID, body.Statuses, body.TenderIDs)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+func (s *Server) refreshTender(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	t, err := s.Store.GetTender(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var categoryID uuid.UUID
+	if len(t.CategorySlugs) > 0 {
+		if c, err := s.Store.GetCategoryBySlug(r.Context(), t.CategorySlugs[0]); err == nil {
+			categoryID = c.ID
+		}
+	}
+	if categoryID == uuid.Nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tender has no category"})
+		return
+	}
+	job, err := s.Store.EnqueueRefresh(r.Context(), categoryID, nil, []uuid.UUID{id})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+func (s *Server) ingestStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.Store.IngestStats(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(stats))
+}
+
+func (s *Server) listTenders(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	list, err := s.Store.ListTenders(r.Context(), q.Get("category"), q.Get("q"), q.Get("status"), 500)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(list))
+}
+
+func (s *Server) getTender(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	t, err := s.Store.GetTender(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := map[string]any{}
+	b, _ := json.Marshal(t)
+	_ = json.Unmarshal(b, &out)
+	if t.CustomerID != nil {
+		if c, err := s.Store.GetCustomer(r.Context(), *t.CustomerID); err == nil {
+			out["customer"] = c
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) patchTender(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var patch map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeErr(w, err)
+		return
+	}
+	t, err := s.Store.UpdateTender(r.Context(), id, patch)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) deleteTender(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.Store.DeleteTender(r.Context(), id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	includeText := r.URL.Query().Get("text") == "1" || r.URL.Query().Get("text") == "true"
+	list, err := s.Store.ListDocuments(r.Context(), id, includeText)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(list))
+}
+
+func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	list, err := s.Store.ListEvents(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(list))
+}
+
+func (s *Server) getAssessment(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	a, err := s.Store.GetAssessment(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusOK, map[string]any{"tender_id": id, "summary": "", "details": map[string]any{}})
+		return
+	}
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) putAssessment(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body store.Assessment
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	body.TenderID = id
+	a, err := s.Store.UpsertAssessment(r.Context(), body)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
+	if s.Analizator == nil || !s.Analizator.Enabled() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "analizator disabled: set ANALIZATOR_URL",
+		})
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		ChecklistID string `json:"checklist_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	t, err := s.Store.GetTender(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	docs, err := s.Store.ListDocuments(r.Context(), id, true)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	texts := make([]string, 0, len(docs))
+	for _, d := range docs {
+		if d.TextContent != nil && strings.TrimSpace(*d.TextContent) != "" {
+			texts = append(texts, *d.TextContent)
+		}
+	}
+	corpus := analizator.BuildCorpus(t.ObjectName, t.Law, t.Status, t.NMCK, texts)
+	if corpus == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "нет текста для анализа: сначала загрузите карточку/документы",
+		})
+		return
+	}
+
+	res, err := s.Analizator.Analyze(r.Context(), analizator.AnalyzeRequest{
+		RegNumber:   t.RegNumber,
+		Text:        corpus,
+		ChecklistID: body.ChecklistID,
+		Title:       t.ObjectName,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+
+	score := res.Score
+	summary := res.Summary
+	if summary == "" && res.Recommendation != "" {
+		summary = "recommendation: " + res.Recommendation
+	}
+	if res.Error != "" && summary == "" {
+		summary = res.Error
+	}
+	a, err := s.Store.UpsertAssessment(r.Context(), store.Assessment{
+		TenderID: id,
+		Summary:  summary,
+		Score:    &score,
+		Details:  analizator.AssessmentDetails(res),
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if res.Status == "failed" {
+		_, _ = s.Store.UpdateTender(r.Context(), id, map[string]any{"analysis_status": "other"})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"assessment": a,
+		"analizator": res,
+	})
+}
+
+func (s *Server) listCustomers(w http.ResponseWriter, r *http.Request) {
+	list, err := s.Store.ListCustomers(r.Context(), r.URL.Query().Get("q"), 200)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, emptySlice(list))
+}
+
+func (s *Server) getCustomer(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	c, err := s.Store.GetCustomer(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) createCustomer(w http.ResponseWriter, r *http.Request) {
+	var c store.Customer
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		writeErr(w, err)
+		return
+	}
+	out, err := s.Store.UpsertCustomer(r.Context(), c)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) patchCustomer(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var c store.Customer
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		writeErr(w, err)
+		return
+	}
+	out, err := s.Store.UpdateCustomer(r.Context(), id, c)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) deleteCustomer(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.Store.DeleteCustomer(r.Context(), id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) stubList(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, []any{})
+}
+
+func emptySlice[T any](v []T) []T {
+	if v == nil {
+		return []T{}
+	}
+	return v
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	if errors.Is(err, store.ErrNotFound) {
+		code = http.StatusNotFound
+	}
+	writeJSON(w, code, map[string]string{"error": err.Error()})
+}
+
+func WithCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

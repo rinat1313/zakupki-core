@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.25-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/core ./cmd/core
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/core /usr/local/bin/core
+ENV HTTP_ADDR=:8080
+EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=5s --retries=10 CMD curl -fsS http://127.0.0.1:8080/api/v1/health || exit 1
+CMD ["core"]
