@@ -50,32 +50,49 @@ func (w *Worker) tick(ctx context.Context) {
 	if w.Analizator == nil || !w.Analizator.Enabled() {
 		return
 	}
-	if w.Control.AnalyzeActive() {
+	free := w.Control.FreeAnalyzeSlots()
+	if free <= 0 {
 		return
 	}
-	tender, err := w.Store.NextTenderReadyForAI(ctx)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			w.Log.Printf("auto-ai: next tender: %v", err)
+	for i := 0; i < free; i++ {
+		analyzeCtx, release, ok := w.Control.BeginAnalyze(ctx)
+		if !ok {
+			return
 		}
-		return
+		tender, err := w.Store.NextTenderReadyForAI(ctx)
+		if err != nil {
+			release()
+			if !errors.Is(err, store.ErrNotFound) {
+				w.Log.Printf("auto-ai: next tender: %v", err)
+			}
+			return
+		}
+		if err := w.Store.MarkAnalyzing(ctx, tender.ID); err != nil {
+			release()
+			w.Log.Printf("auto-ai: claim %s: %v", tender.RegNumber, err)
+			continue
+		}
+		t := tender
+		rel := release
+		aCtx := analyzeCtx
+		w.Log.Printf("auto-ai: start %s (parallel %d)", t.RegNumber, i+1)
+		go func() {
+			opt := &AnalyzeOptions{PreCtx: aCtx, Release: rel}
+			if err := AnalyzeTender(ctx, w.Store, w.Control, w.Analizator, t, opt); err != nil {
+				w.Log.Printf("auto-ai: %s error: %v", t.RegNumber, err)
+				return
+			}
+			w.Log.Printf("auto-ai: done %s", t.RegNumber)
+		}()
 	}
-	if err := w.Store.MarkAnalyzing(ctx, tender.ID); err != nil {
-		w.Log.Printf("auto-ai: claim %s: %v", tender.RegNumber, err)
-		return
-	}
-	w.Log.Printf("auto-ai: start %s", tender.RegNumber)
-	if err := AnalyzeTender(ctx, w.Store, w.Control, w.Analizator, tender, nil); err != nil {
-		w.Log.Printf("auto-ai: %s error: %v", tender.RegNumber, err)
-		return
-	}
-	w.Log.Printf("auto-ai: done %s", tender.RegNumber)
 }
 
 // AnalyzeOptions — опциональный чек-лист / конфиг.
 type AnalyzeOptions struct {
 	ConfigID    string
 	ChecklistID string
+	PreCtx      context.Context
+	Release     func()
 }
 
 // AnalyzeTender — общая логика ручного и авто-анализа.
@@ -124,11 +141,19 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 	_ = st.SetTenderProgress(ctx, t.ID, nil, &startPct)
 	_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "analyzing"})
 
-	analyzeCtx, ok := ctrl.BeginAnalyze(ctx)
-	if !ok {
-		return errBusy
+	var analyzeCtx context.Context
+	var release func()
+	if opt != nil && opt.PreCtx != nil && opt.Release != nil {
+		analyzeCtx = opt.PreCtx
+		release = opt.Release
+	} else {
+		var ok bool
+		analyzeCtx, release, ok = ctrl.BeginAnalyze(ctx)
+		if !ok {
+			return errBusy
+		}
 	}
-	defer ctrl.EndAnalyze()
+	defer release()
 
 	req := analizator.AnalyzeRequest{
 		RegNumber:  t.RegNumber,

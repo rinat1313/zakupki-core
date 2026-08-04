@@ -99,7 +99,7 @@ func (c *Client) Fetch(ctx context.Context, reg, site string) (*FetchResponse, e
 		return nil, err
 	}
 	defer res.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, 32<<20))
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 128<<20))
 	if err != nil {
 		return nil, err
 	}
