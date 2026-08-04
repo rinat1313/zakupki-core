@@ -107,6 +107,35 @@ func main() {
 		log.Printf("analizator: disabled")
 	}
 
+	// Синхронизация ёмкости AI с пулом LM Studio.
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if !az.Enabled() {
+					ctrl.SetAnalyzeCapacity(1)
+					continue
+				}
+				st, err := az.PoolStatus(ctx)
+				if err != nil || st == nil {
+					continue
+				}
+				n := st.MaxParallel
+				if n < 1 {
+					n = st.Healthy
+				}
+				if n < 1 {
+					n = 1
+				}
+				ctrl.SetAnalyzeCapacity(n)
+			}
+		}
+	}()
+
 	auto := &autoai.Worker{Store: st, Control: ctrl, Analizator: az, Log: log.Default()}
 	go auto.Run(ctx)
 

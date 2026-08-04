@@ -173,6 +173,44 @@ func (c *Client) Progress(ctx context.Context, reg string) (*ProgressInfo, error
 	return &out, nil
 }
 
+// PoolStatus — GET /api/v1/lm/pool.
+type PoolStatus struct {
+	Total       int `json:"total"`
+	Healthy     int `json:"healthy"`
+	Busy        int `json:"busy"`
+	Available   int `json:"available"`
+	MaxParallel int `json:"max_parallel"`
+}
+
+func (c *Client) PoolStatus(ctx context.Context) (*PoolStatus, error) {
+	if !c.Enabled() {
+		return nil, fmt.Errorf("analizator URL not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/v1/lm/pool", nil)
+	if err != nil {
+		return nil, err
+	}
+	// короткий таймаут для статуса
+	cl := &http.Client{Timeout: 5 * time.Second}
+	res, err := cl.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode >= 300 {
+		return nil, fmt.Errorf("pool HTTP %d", res.StatusCode)
+	}
+	var out PoolStatus
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // BuildCorpus собирает текст тендера из карточки и документов для передачи в LLM.
 func BuildCorpus(objectName, law, status string, nmck *float64, docTexts []string) string {
 	var b strings.Builder
