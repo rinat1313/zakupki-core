@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -484,6 +485,9 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.Control.EndAnalyze()
+
+	log.Printf("analyze tender %s reg=%s corpus_runes=%d docs_with_text=%d → %s",
+		id, t.RegNumber, len([]rune(corpus)), len(texts), s.Analizator.BaseURL)
 
 	res, err := s.Analizator.Analyze(analyzeCtx, analizator.AnalyzeRequest{
 		RegNumber:   t.RegNumber,
