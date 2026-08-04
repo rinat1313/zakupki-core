@@ -12,14 +12,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rinat1313/zakupki-core/internal/control"
 	"github.com/rinat1313/zakupki-core/internal/parserclient"
 	"github.com/rinat1313/zakupki-core/internal/store"
 )
 
 type Worker struct {
-	Store  *store.Store
-	Parser *parserclient.Client
-	Log    *log.Logger
+	Store   *store.Store
+	Parser  *parserclient.Client
+	Control *control.Controller
+	Log     *log.Logger
 }
 
 func (w *Worker) Run(ctx context.Context) {
@@ -39,8 +41,15 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 func (w *Worker) tick(ctx context.Context) {
+	if w.Control != nil && !w.Control.IngestAllowsWork() {
+		return
+	}
 	item, job, err := w.Store.ClaimNextItem(ctx)
 	if err != nil {
+		return
+	}
+	if w.Control != nil && !w.Control.IngestAllowsWork() {
+		_ = w.Store.RequeueItem(ctx, item.ID)
 		return
 	}
 	w.logItem(ctx, job, item, "start", "начало обработки %s (%s)", item.RegNumber, item.SourceSite)

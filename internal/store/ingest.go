@@ -153,24 +153,70 @@ func (s *Store) FinishItem(ctx context.Context, itemID uuid.UUID, status string,
 	var jobID uuid.UUID
 	err = tx.QueryRow(ctx, `
 		UPDATE ingest_job_items SET status=$2::ingest_item_status, error=$3, tender_id=$4, updated_at=now()
-		WHERE id=$1 RETURNING job_id`, itemID, status, errMsg, tenderID).Scan(&jobID)
+		WHERE id=$1 AND status='running' RETURNING job_id`, itemID, status, errMsg, tenderID).Scan(&jobID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// item already cancelled/finished (e.g. stop while in flight)
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `
 		UPDATE ingest_jobs SET
-		  done_items = (SELECT count(*) FROM ingest_job_items WHERE job_id=$1 AND status IN ('ok','skipped','unsupported_source','failed_analyze')),
+		  done_items = (SELECT count(*) FROM ingest_job_items WHERE job_id=$1 AND status IN ('ok','skipped','unsupported_source','failed_analyze','cancelled')),
 		  error_items = (SELECT count(*) FROM ingest_job_items WHERE job_id=$1 AND status='error'),
 		  status = CASE
 		    WHEN (SELECT count(*) FROM ingest_job_items WHERE job_id=$1 AND status IN ('queued','running'))=0 THEN 'done'
 		    ELSE 'running'
 		  END,
 		  updated_at=now()
-		WHERE id=$1`, jobID)
+		WHERE id=$1 AND status <> 'cancelled'`, jobID)
 	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// RequeueItem returns a running item to the queue (used when ingest is paused mid-claim).
+func (s *Store) RequeueItem(ctx context.Context, itemID uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `
+		UPDATE ingest_job_items SET status='queued', updated_at=now()
+		WHERE id=$1 AND status='running'`, itemID)
+	return err
+}
+
+// CancelActiveIngest marks queued/running items and their jobs as cancelled.
+func (s *Store) CancelActiveIngest(ctx context.Context) (items int64, jobs int64, err error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE ingest_job_items
+		SET status='cancelled', error='stopped by user', updated_at=now()
+		WHERE status IN ('queued','running')`)
+	if err != nil {
+		return 0, 0, err
+	}
+	items = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `
+		UPDATE ingest_jobs SET
+		  done_items = (SELECT count(*) FROM ingest_job_items WHERE job_id=ingest_jobs.id AND status IN ('ok','skipped','unsupported_source','failed_analyze','cancelled')),
+		  error_items = (SELECT count(*) FROM ingest_job_items WHERE job_id=ingest_jobs.id AND status='error'),
+		  status = 'cancelled',
+		  updated_at = now()
+		WHERE status IN ('queued','running')`)
+	if err != nil {
+		return 0, 0, err
+	}
+	jobs = tag.RowsAffected()
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+	return items, jobs, nil
 }
 
 // RequeueStuckRunning returns items left in running after a crash/restart back to queued.

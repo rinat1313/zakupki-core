@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/rinat1313/zakupki-core/internal/analizator"
+	"github.com/rinat1313/zakupki-core/internal/control"
 	"github.com/rinat1313/zakupki-core/internal/store"
 	"github.com/rinat1313/zakupki-core/internal/ingest"
 
@@ -17,11 +18,15 @@ import (
 type Server struct {
 	Store      *store.Store
 	Analizator *analizator.Client
+	Control    *control.Controller
 	Mux        *http.ServeMux
 }
 
-func New(st *store.Store, az *analizator.Client) *Server {
-	s := &Server{Store: st, Analizator: az, Mux: http.NewServeMux()}
+func New(st *store.Store, az *analizator.Client, ctrl *control.Controller) *Server {
+	if ctrl == nil {
+		ctrl = control.New()
+	}
+	s := &Server{Store: st, Analizator: az, Control: ctrl, Mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -52,6 +57,14 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/assessment", s.getAssessment)
 	s.Mux.HandleFunc("PUT /api/v1/tenders/{id}/assessment", s.putAssessment)
 	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/analyze", s.analyzeTender)
+
+	s.Mux.HandleFunc("GET /api/v1/workers", s.workersStatus)
+	s.Mux.HandleFunc("POST /api/v1/workers/ingest/pause", s.ingestPause)
+	s.Mux.HandleFunc("POST /api/v1/workers/ingest/resume", s.ingestResume)
+	s.Mux.HandleFunc("POST /api/v1/workers/ingest/stop", s.ingestStop)
+	s.Mux.HandleFunc("POST /api/v1/workers/analyze/pause", s.analyzePause)
+	s.Mux.HandleFunc("POST /api/v1/workers/analyze/resume", s.analyzeResume)
+	s.Mux.HandleFunc("POST /api/v1/workers/analyze/stop", s.analyzeStop)
 
 	s.Mux.HandleFunc("GET /api/v1/customers", s.listCustomers)
 	s.Mux.HandleFunc("GET /api/v1/customers/{id}", s.getCustomer)
@@ -140,6 +153,8 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if hdr != nil {
 		name = hdr.Filename
 	}
+	// New upload resumes collection if it was stopped/paused.
+	s.Control.ResumeIngest()
 	job, err := ingest.StartIngest(r.Context(), s.Store, slug, title, name, items)
 	if err != nil {
 		writeErr(w, err)
@@ -246,6 +261,7 @@ func (s *Server) refreshCategory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	s.Control.ResumeIngest()
 	writeJSON(w, http.StatusAccepted, job)
 }
 
@@ -275,6 +291,7 @@ func (s *Server) refreshTender(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	s.Control.ResumeIngest()
 	writeJSON(w, http.StatusAccepted, job)
 }
 
@@ -459,13 +476,26 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.Analizator.Analyze(r.Context(), analizator.AnalyzeRequest{
+	analyzeCtx, ok := s.Control.BeginAnalyze(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "AI-анализ на паузе — нажмите «Продолжить AI»",
+		})
+		return
+	}
+	defer s.Control.EndAnalyze()
+
+	res, err := s.Analizator.Analyze(analyzeCtx, analizator.AnalyzeRequest{
 		RegNumber:   t.RegNumber,
 		Text:        corpus,
 		ChecklistID: body.ChecklistID,
 		Title:       t.ObjectName,
 	})
 	if err != nil {
+		if analyzeCtx.Err() != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "AI-анализ остановлен"})
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
@@ -496,6 +526,48 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 		"assessment": a,
 		"analizator": res,
 	})
+}
+
+func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.Control.Status())
+}
+
+func (s *Server) ingestPause(w http.ResponseWriter, r *http.Request) {
+	s.Control.PauseIngest()
+	writeJSON(w, http.StatusOK, s.Control.Status())
+}
+
+func (s *Server) ingestResume(w http.ResponseWriter, r *http.Request) {
+	s.Control.ResumeIngest()
+	writeJSON(w, http.StatusOK, s.Control.Status())
+}
+
+func (s *Server) ingestStop(w http.ResponseWriter, r *http.Request) {
+	s.Control.StopIngest()
+	items, jobs, err := s.Store.CancelActiveIngest(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := s.Control.Status()
+	out["cancelled_items"] = items
+	out["cancelled_jobs"] = jobs
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) analyzePause(w http.ResponseWriter, r *http.Request) {
+	s.Control.PauseAnalyze()
+	writeJSON(w, http.StatusOK, s.Control.Status())
+}
+
+func (s *Server) analyzeResume(w http.ResponseWriter, r *http.Request) {
+	s.Control.ResumeAnalyze()
+	writeJSON(w, http.StatusOK, s.Control.Status())
+}
+
+func (s *Server) analyzeStop(w http.ResponseWriter, r *http.Request) {
+	s.Control.StopAnalyze()
+	writeJSON(w, http.StatusOK, s.Control.Status())
 }
 
 func (s *Server) listCustomers(w http.ResponseWriter, r *http.Request) {
