@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,9 +10,10 @@ import (
 	"strings"
 
 	"github.com/rinat1313/zakupki-core/internal/analizator"
+	"github.com/rinat1313/zakupki-core/internal/autoai"
 	"github.com/rinat1313/zakupki-core/internal/control"
-	"github.com/rinat1313/zakupki-core/internal/store"
 	"github.com/rinat1313/zakupki-core/internal/ingest"
+	"github.com/rinat1313/zakupki-core/internal/store"
 
 	"github.com/google/uuid"
 )
@@ -60,11 +62,10 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/analyze", s.analyzeTender)
 
 	s.Mux.HandleFunc("GET /api/v1/workers", s.workersStatus)
+	s.Mux.HandleFunc("PUT /api/v1/workers/auto-ai", s.setAutoAI)
 	s.Mux.HandleFunc("POST /api/v1/workers/ingest/pause", s.ingestPause)
 	s.Mux.HandleFunc("POST /api/v1/workers/ingest/resume", s.ingestResume)
 	s.Mux.HandleFunc("POST /api/v1/workers/ingest/stop", s.ingestStop)
-	s.Mux.HandleFunc("POST /api/v1/workers/analyze/pause", s.analyzePause)
-	s.Mux.HandleFunc("POST /api/v1/workers/analyze/resume", s.analyzeResume)
 	s.Mux.HandleFunc("POST /api/v1/workers/analyze/stop", s.analyzeStop)
 
 	s.Mux.HandleFunc("GET /api/v1/customers", s.listCustomers)
@@ -326,6 +327,7 @@ func (s *Server) getTender(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	_ = s.Store.EnrichTenderUI(r.Context(), t)
 	out := map[string]any{}
 	b, _ := json.Marshal(t)
 	_ = json.Unmarshal(b, &out)
@@ -439,7 +441,7 @@ func (s *Server) putAssessment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 	if s.Analizator == nil || !s.Analizator.Enabled() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "analizator disabled: set ANALIZATOR_URL",
+			"error": "analizator выключен: задайте ANALIZATOR_URL",
 		})
 		return
 	}
@@ -458,81 +460,54 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	docs, err := s.Store.ListDocuments(r.Context(), id, true)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	texts := make([]string, 0, len(docs))
-	for _, d := range docs {
-		if d.TextContent != nil && strings.TrimSpace(*d.TextContent) != "" {
-			texts = append(texts, *d.TextContent)
-		}
-	}
-	corpus := analizator.BuildCorpus(t.ObjectName, t.Law, t.Status, t.NMCK, texts)
-	if corpus == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "нет текста для анализа: сначала загрузите карточку/документы",
-		})
-		return
-	}
 
-	analyzeCtx, ok := s.Control.BeginAnalyze(r.Context())
-	if !ok {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "AI-анализ на паузе — нажмите «Продолжить AI»",
-		})
-		return
-	}
-	defer s.Control.EndAnalyze()
-
-	log.Printf("analyze tender %s reg=%s corpus_runes=%d docs_with_text=%d → %s",
-		id, t.RegNumber, len([]rune(corpus)), len(texts), s.Analizator.BaseURL)
-
-	res, err := s.Analizator.Analyze(analyzeCtx, analizator.AnalyzeRequest{
-		RegNumber:   t.RegNumber,
-		Text:        corpus,
-		ChecklistID: body.ChecklistID,
-		Title:       t.ObjectName,
-	})
-	if err != nil {
-		if analyzeCtx.Err() != nil {
+	log.Printf("analyze tender %s reg=%s → %s", id, t.RegNumber, s.Analizator.BaseURL)
+	if err := autoai.AnalyzeTender(r.Context(), s.Store, s.Control, s.Analizator, t, body.ChecklistID); err != nil {
+		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "canceled") || strings.Contains(err.Error(), "cancelled") {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "AI-анализ остановлен"})
+			return
+		}
+		if strings.Contains(err.Error(), "нет текста") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
-
-	score := res.Score
-	summary := res.Summary
-	if summary == "" && res.Recommendation != "" {
-		summary = "recommendation: " + res.Recommendation
-	}
-	if res.Error != "" && summary == "" {
-		summary = res.Error
-	}
-	a, err := s.Store.UpsertAssessment(r.Context(), store.Assessment{
-		TenderID: id,
-		Summary:  summary,
-		Score:    &score,
-		Details:  analizator.AssessmentDetails(res),
-	})
+	a, err := s.Store.GetAssessment(r.Context(), id)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	if res.Status == "failed" {
-		_, _ = s.Store.UpdateTender(r.Context(), id, map[string]any{"analysis_status": "other"})
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"assessment": a,
-		"analizator": res,
 	})
 }
 
 func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.Control.Status())
+}
+
+func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled *bool `json:"enabled"`
+		AutoAI  *bool `json:"auto_ai"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	on := false
+	switch {
+	case body.Enabled != nil:
+		on = *body.Enabled
+	case body.AutoAI != nil:
+		on = *body.AutoAI
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "нужно поле enabled или auto_ai"})
+		return
+	}
+	s.Control.SetAutoAI(on)
 	writeJSON(w, http.StatusOK, s.Control.Status())
 }
 
@@ -557,16 +532,6 @@ func (s *Server) ingestStop(w http.ResponseWriter, r *http.Request) {
 	out["cancelled_items"] = items
 	out["cancelled_jobs"] = jobs
 	writeJSON(w, http.StatusOK, out)
-}
-
-func (s *Server) analyzePause(w http.ResponseWriter, r *http.Request) {
-	s.Control.PauseAnalyze()
-	writeJSON(w, http.StatusOK, s.Control.Status())
-}
-
-func (s *Server) analyzeResume(w http.ResponseWriter, r *http.Request) {
-	s.Control.ResumeAnalyze()
-	writeJSON(w, http.StatusOK, s.Control.Status())
 }
 
 func (s *Server) analyzeStop(w http.ResponseWriter, r *http.Request) {
