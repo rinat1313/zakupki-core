@@ -44,6 +44,7 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	stmts := []string{
 		`ALTER TYPE ingest_item_status ADD VALUE IF NOT EXISTS 'failed_analyze'`,
+		`ALTER TYPE ingest_item_status ADD VALUE IF NOT EXISTS 'cancelled'`,
 		`CREATE TABLE IF NOT EXISTS ingest_job_logs (
 		  id           BIGSERIAL PRIMARY KEY,
 		  job_id       UUID NOT NULL REFERENCES ingest_jobs(id) ON DELETE CASCADE,

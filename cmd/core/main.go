@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rinat1313/zakupki-core/internal/analizator"
+	"github.com/rinat1313/zakupki-core/internal/control"
 	"github.com/rinat1313/zakupki-core/internal/httpapi"
 	"github.com/rinat1313/zakupki-core/internal/ingest"
 	"github.com/rinat1313/zakupki-core/internal/parserclient"
@@ -39,7 +40,8 @@ func main() {
 	} else {
 		log.Printf("parser client: disabled (set PARSER_URL)")
 	}
-	w := &ingest.Worker{Store: st, Parser: parser, Log: log.Default()}
+	ctrl := control.New()
+	w := &ingest.Worker{Store: st, Parser: parser, Control: ctrl, Log: log.Default()}
 	go w.Run(ctx)
 
 	az := analizator.New(os.Getenv("ANALIZATOR_URL"))
@@ -48,7 +50,7 @@ func main() {
 	} else {
 		log.Printf("analizator: disabled")
 	}
-	srv := httpapi.New(st, az)
+	srv := httpapi.New(st, az, ctrl)
 
 	addr := os.Getenv("HTTP_ADDR")
 	if addr == "" {
