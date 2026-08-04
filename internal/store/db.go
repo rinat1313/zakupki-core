@@ -18,8 +18,8 @@ func Connect(ctx context.Context) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 10
-	cfg.MinConns = 1
+	cfg.MaxConns = 24
+	cfg.MinConns = 2
 	cfg.MaxConnLifetime = time.Hour
 
 	var pool *pgxpool.Pool
@@ -45,6 +45,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	stmts := []string{
 		`ALTER TYPE ingest_item_status ADD VALUE IF NOT EXISTS 'failed_analyze'`,
 		`ALTER TYPE ingest_item_status ADD VALUE IF NOT EXISTS 'cancelled'`,
+		`ALTER TYPE analysis_status ADD VALUE IF NOT EXISTS 'analyzing'`,
 		`CREATE TABLE IF NOT EXISTS ingest_job_logs (
 		  id           BIGSERIAL PRIMARY KEY,
 		  job_id       UUID NOT NULL REFERENCES ingest_jobs(id) ON DELETE CASCADE,

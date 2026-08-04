@@ -19,14 +19,23 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 	rows, err := s.Pool.Query(ctx, `
 		SELECT t.id,t.reg_number,t.source_site,t.law,t.customer_id,t.object_name,t.status,t.nmck,t.currency,
 		       t.published_at,t.updated_on_site,t.application_end,t.analysis_status,t.payload,t.created_at,t.updated_at,
-		       COALESCE(array_agg(c.slug) FILTER (WHERE c.slug IS NOT NULL), '{}')
+		       COALESCE(array_agg(DISTINCT c.slug) FILTER (WHERE c.slug IS NOT NULL), '{}'),
+		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed),0),
+		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='processed'),0),
+		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='unprocessed'),0),
+		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0),0),
+		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_error<>''),0),
+		       COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=t.reg_number ORDER BY i.updated_at DESC LIMIT 1),''),
+		       a.score,
+		       COALESCE(a.details->>'recommendation', '')
 		FROM tenders t
 		LEFT JOIN tender_categories tc ON tc.tender_id=t.id
 		LEFT JOIN categories c ON c.id=tc.category_id
+		LEFT JOIN tender_assessments a ON a.tender_id=t.id
 		WHERE ($1='' OR c.slug=$1)
 		  AND ($2='' OR t.reg_number ILIKE '%'||$2||'%' OR t.object_name ILIKE '%'||$2||'%')
 		  AND ($3='' OR t.analysis_status::text=$3)
-		GROUP BY t.id
+		GROUP BY t.id, a.score, a.details
 		ORDER BY t.application_end NULLS LAST, t.updated_at DESC
 		LIMIT $4`, categorySlug, strings.TrimSpace(q), strings.TrimSpace(status), limit)
 	if err != nil {
@@ -36,13 +45,149 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 	var out []Tender
 	for rows.Next() {
 		var t Tender
+		var rec string
 		if err := rows.Scan(&t.ID, &t.RegNumber, &t.SourceSite, &t.Law, &t.CustomerID, &t.ObjectName, &t.Status, &t.NMCK, &t.Currency,
-			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt, &t.CategorySlugs); err != nil {
+			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt, &t.CategorySlugs,
+			&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
+			&t.IngestStatus, &t.AssessScore, &rec); err != nil {
 			return nil, err
 		}
+		t.Recommendation = rec
+		enrichTenderProgress(&t)
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+func enrichTenderProgress(t *Tender) {
+	// Сбор
+	switch {
+	case t.DocsTotal > 0 && t.DocsUnprocessed == 0 && t.DocsErrors == 0:
+		t.CollectPct = 100
+		ok := true
+		t.CollectOK = &ok
+	case t.DocsTotal > 0 && t.DocsUnprocessed == 0 && t.DocsErrors > 0:
+		t.CollectPct = 100
+		ok := false
+		t.CollectOK = &ok
+	case t.DocsTotal > 0:
+		t.CollectPct = int(float64(t.DocsProcessed) / float64(t.DocsTotal) * 100)
+	case t.IngestStatus == "running" || t.IngestStatus == "queued":
+		t.CollectPct = 10
+	case t.IngestStatus == "error" || t.IngestStatus == "failed_analyze":
+		t.CollectPct = 100
+		ok := false
+		t.CollectOK = &ok
+	case t.IngestStatus == "ok":
+		t.CollectPct = 100
+		ok := true
+		t.CollectOK = &ok
+	default:
+		t.CollectPct = 0
+	}
+
+	// AI
+	switch t.AnalysisStatus {
+	case "analyzed":
+		t.AIPct = 100
+		ok := true
+		if t.Recommendation == "skip" || t.Recommendation == "unknown" {
+			// skip — корректный итог, не ошибка процесса
+			ok = true
+		}
+		t.AIOK = &ok
+	case "other":
+		t.AIPct = 100
+		ok := false
+		t.AIOK = &ok
+	case "analyzing":
+		t.AIPct = 40
+	default:
+		t.AIPct = 0
+	}
+
+	t.ReadyForAI = t.DocsTotal > 0 && t.DocsUnprocessed == 0 && t.DocsWithText > 0 &&
+		(t.AnalysisStatus == "none" || t.AnalysisStatus == "")
+
+	switch {
+	case t.CollectOK != nil && !*t.CollectOK:
+		t.CardTone = "bad"
+	case t.AIOK != nil && !*t.AIOK:
+		t.CardTone = "bad"
+	case t.Recommendation == "skip" || t.AnalysisStatus == "irrelevant" || t.AnalysisStatus == "delete":
+		t.CardTone = "bad"
+	case t.CollectOK != nil && *t.CollectOK && t.DocsWithText > 0 && t.DocsUnprocessed == 0:
+		t.CardTone = "good"
+	case t.AnalysisStatus == "analyzed" && (t.Recommendation == "participate" || t.Recommendation == "caution"):
+		t.CardTone = "good"
+	default:
+		t.CardTone = "neutral"
+	}
+}
+
+// NextTenderReadyForAI — карточка готова к авто-анализу (все доки обработаны, есть текст, AI ещё не делали).
+func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
+	var id uuid.UUID
+	err := s.Pool.QueryRow(ctx, `
+		SELECT t.id FROM tenders t
+		WHERE t.analysis_status IN ('none')
+		  AND EXISTS (SELECT 1 FROM documents d WHERE d.tender_id=t.id AND NOT d.removed)
+		  AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='unprocessed')
+		  AND EXISTS (SELECT 1 FROM documents d WHERE d.tender_id=t.id AND NOT d.removed
+		              AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0)
+		ORDER BY t.updated_at ASC
+		LIMIT 1`).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.GetTender(ctx, id)
+}
+
+// MarkAnalyzing — атомарно забирает карточку под авто-AI (только из none).
+func (s *Store) MarkAnalyzing(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.Pool.Exec(ctx, `UPDATE tenders SET analysis_status='analyzing', updated_at=now() WHERE id=$1 AND analysis_status='none'`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("tender not claimed for analyzing")
+	}
+	return nil
+}
+
+// RequeueStuckAnalyzing — после рестарта core вернуть «зависшие» analyzing → none.
+func (s *Store) RequeueStuckAnalyzing(ctx context.Context) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `UPDATE tenders SET analysis_status='none', updated_at=now() WHERE analysis_status='analyzing'`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// EnrichTenderUI заполняет прогресс/тон для одной карточки (модалка).
+func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
+	err := s.Pool.QueryRow(ctx, `
+		SELECT
+		  COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=$1 AND NOT d.removed),0),
+		  COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=$1 AND NOT d.removed AND d.process_status='processed'),0),
+		  COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=$1 AND NOT d.removed AND d.process_status='unprocessed'),0),
+		  COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=$1 AND NOT d.removed AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0),0),
+		  COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=$1 AND NOT d.removed AND d.process_error<>''),0),
+		  COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=$2 ORDER BY i.updated_at DESC LIMIT 1),''),
+		  a.score,
+		  COALESCE(a.details->>'recommendation', '')
+		FROM (SELECT 1) _
+		LEFT JOIN tender_assessments a ON a.tender_id=$1`, t.ID, t.RegNumber).
+		Scan(&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
+			&t.IngestStatus, &t.AssessScore, &t.Recommendation)
+	if err != nil {
+		return err
+	}
+	enrichTenderProgress(t)
+	return nil
 }
 
 func (s *Store) GetTender(ctx context.Context, id uuid.UUID) (*Tender, error) {

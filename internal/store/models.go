@@ -58,6 +58,22 @@ type Tender struct {
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 	CategorySlugs   []string        `json:"category_slugs,omitempty"`
+
+	// Прогресс для UI (заполняется в ListTenders).
+	DocsTotal       int      `json:"docs_total"`
+	DocsProcessed   int      `json:"docs_processed"`
+	DocsUnprocessed int      `json:"docs_unprocessed"`
+	DocsWithText    int      `json:"docs_with_text"`
+	DocsErrors      int      `json:"docs_errors"`
+	CollectPct      int      `json:"collect_pct"`
+	CollectOK       *bool    `json:"collect_ok,omitempty"` // nil=в процессе, true/false=итог
+	AIPct           int      `json:"ai_pct"`
+	AIOK            *bool    `json:"ai_ok,omitempty"`
+	IngestStatus    string   `json:"ingest_status,omitempty"`
+	Recommendation  string   `json:"recommendation,omitempty"`
+	AssessScore     *float64 `json:"assess_score,omitempty"`
+	ReadyForAI      bool     `json:"ready_for_ai"`
+	CardTone        string   `json:"card_tone,omitempty"` // good|bad|neutral
 }
 
 type Document struct {

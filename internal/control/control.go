@@ -1,4 +1,4 @@
-// Package control — пауза/стоп воркеров сбора и AI-анализа.
+// Package control — пауза/стоп сбора и вкл/выкл авто-AI.
 package control
 
 import (
@@ -13,11 +13,11 @@ const (
 	StateStopped = "stopped"
 )
 
-// Controller управляет ingest и analyze независимо.
+// Controller управляет ingest и авто-AI независимо.
 type Controller struct {
 	ingestPaused  atomic.Bool
 	ingestStopped atomic.Bool
-	analyzePaused atomic.Bool
+	autoAI        atomic.Bool // авто-анализ включён
 
 	mu            sync.Mutex
 	analyzeCancel context.CancelFunc
@@ -30,8 +30,13 @@ func (c *Controller) IngestAllowsWork() bool {
 	return !c.ingestPaused.Load() && !c.ingestStopped.Load()
 }
 
-func (c *Controller) AnalyzeAllowsStart() bool {
-	return !c.analyzePaused.Load()
+func (c *Controller) AutoAIEnabled() bool { return c.autoAI.Load() }
+
+func (c *Controller) SetAutoAI(on bool) {
+	c.autoAI.Store(on)
+	if !on {
+		c.cancelAnalyzeLocked()
+	}
 }
 
 func (c *Controller) PauseIngest() {
@@ -44,34 +49,14 @@ func (c *Controller) ResumeIngest() {
 	c.ingestStopped.Store(false)
 }
 
-// StopIngest ставит паузу и помечает режим stop (очередь чистит API/store).
 func (c *Controller) StopIngest() {
 	c.ingestPaused.Store(true)
 	c.ingestStopped.Store(true)
 }
 
-func (c *Controller) PauseAnalyze() { c.analyzePaused.Store(true) }
-
-func (c *Controller) ResumeAnalyze() { c.analyzePaused.Store(false) }
-
-// StopAnalyze отменяет текущий AI-запрос и ставит паузу на новые.
-func (c *Controller) StopAnalyze() {
-	c.analyzePaused.Store(true)
-	c.mu.Lock()
-	cancel := c.analyzeCancel
-	c.analyzeCancel = nil
-	c.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
-// BeginAnalyze возвращает ctx, который можно отменить через StopAnalyze.
-// ok=false если анализ на паузе.
+// BeginAnalyze — ручной или авто-анализ. Не зависит от autoAI (ручной всегда можно).
+// cancelPrev — отменить текущий, если уже идёт.
 func (c *Controller) BeginAnalyze(parent context.Context) (ctx context.Context, ok bool) {
-	if c.analyzePaused.Load() {
-		return parent, false
-	}
 	ctx, cancel := context.WithCancel(parent)
 	c.mu.Lock()
 	if c.analyzeCancel != nil {
@@ -85,6 +70,14 @@ func (c *Controller) BeginAnalyze(parent context.Context) (ctx context.Context, 
 
 func (c *Controller) EndAnalyze() {
 	c.analyzeActive.Store(false)
+	c.cancelAnalyzeLocked()
+}
+
+func (c *Controller) StopAnalyze() {
+	c.cancelAnalyzeLocked()
+}
+
+func (c *Controller) cancelAnalyzeLocked() {
 	c.mu.Lock()
 	cancel := c.analyzeCancel
 	c.analyzeCancel = nil
@@ -92,7 +85,10 @@ func (c *Controller) EndAnalyze() {
 	if cancel != nil {
 		cancel()
 	}
+	c.analyzeActive.Store(false)
 }
+
+func (c *Controller) AnalyzeActive() bool { return c.analyzeActive.Load() }
 
 func (c *Controller) Status() map[string]any {
 	ingest := StateRunning
@@ -101,13 +97,9 @@ func (c *Controller) Status() map[string]any {
 	} else if c.ingestPaused.Load() {
 		ingest = StatePaused
 	}
-	analyze := StateRunning
-	if c.analyzePaused.Load() {
-		analyze = StatePaused
-	}
 	return map[string]any{
 		"ingest":         ingest,
-		"analyze":        analyze,
+		"auto_ai":        c.autoAI.Load(),
 		"analyze_active": c.analyzeActive.Load(),
 	}
 }
