@@ -56,6 +56,20 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS ingest_job_logs_job_idx ON ingest_job_logs(job_id, id)`,
+		`CREATE TABLE IF NOT EXISTS ai_configs (
+		  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		  category_id    UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+		  name           TEXT NOT NULL,
+		  system_prompt  TEXT NOT NULL DEFAULT '',
+		  user_prompt    TEXT NOT NULL DEFAULT '',
+		  rules          TEXT NOT NULL DEFAULT '',
+		  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  UNIQUE (category_id, name)
+		)`,
+		`ALTER TABLE categories ADD COLUMN IF NOT EXISTS active_ai_config_id UUID`,
+		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS collect_pct INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS ai_pct INT NOT NULL DEFAULT 0`,
 	}
 	for _, q := range stmts {
 		if _, err := pool.Exec(ctx, q); err != nil {

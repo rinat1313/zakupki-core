@@ -16,10 +16,11 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type Category struct {
-	ID        uuid.UUID `json:"id"`
-	Slug      string    `json:"slug"`
-	Title     string    `json:"title"`
-	CreatedAt time.Time `json:"created_at"`
+	ID               uuid.UUID  `json:"id"`
+	Slug             string     `json:"slug"`
+	Title            string     `json:"title"`
+	ActiveAIConfigID *uuid.UUID `json:"active_ai_config_id,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 type Customer struct {
@@ -73,7 +74,9 @@ type Tender struct {
 	Recommendation  string   `json:"recommendation,omitempty"`
 	AssessScore     *float64 `json:"assess_score,omitempty"`
 	ReadyForAI      bool     `json:"ready_for_ai"`
-	CardTone        string   `json:"card_tone,omitempty"` // good|bad|neutral
+	CardTone        string   `json:"card_tone,omitempty"` // good|bad|pending|neutral
+	StoredCollectPct int     `json:"-"`
+	StoredAIPct      int     `json:"-"`
 }
 
 type Document struct {
@@ -154,7 +157,7 @@ func slugify(title string) string {
 }
 
 func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id, slug, title, created_at FROM categories ORDER BY title`)
+	rows, err := s.Pool.Query(ctx, `SELECT id, slug, title, active_ai_config_id, created_at FROM categories ORDER BY title`)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +165,7 @@ func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
 	var out []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.ActiveAIConfigID, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -172,8 +175,8 @@ func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
 
 func (s *Store) GetCategoryBySlug(ctx context.Context, slug string) (*Category, error) {
 	var c Category
-	err := s.Pool.QueryRow(ctx, `SELECT id, slug, title, created_at FROM categories WHERE slug=$1`, slug).
-		Scan(&c.ID, &c.Slug, &c.Title, &c.CreatedAt)
+	err := s.Pool.QueryRow(ctx, `SELECT id, slug, title, active_ai_config_id, created_at FROM categories WHERE slug=$1`, slug).
+		Scan(&c.ID, &c.Slug, &c.Title, &c.ActiveAIConfigID, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -195,8 +198,8 @@ func (s *Store) CreateCategory(ctx context.Context, title, slug string) (*Catego
 	err := s.Pool.QueryRow(ctx,
 		`INSERT INTO categories(slug, title) VALUES($1,$2)
 		 ON CONFLICT (slug) DO UPDATE SET title=EXCLUDED.title
-		 RETURNING id, slug, title, created_at`, slug, title).
-		Scan(&c.ID, &c.Slug, &c.Title, &c.CreatedAt)
+		 RETURNING id, slug, title, active_ai_config_id, created_at`, slug, title).
+		Scan(&c.ID, &c.Slug, &c.Title, &c.ActiveAIConfigID, &c.CreatedAt)
 	if err != nil {
 		return nil, err
 	}

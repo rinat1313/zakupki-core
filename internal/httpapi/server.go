@@ -42,6 +42,11 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/tenders", s.clearCategoryTenders)
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/jobs", s.clearCategoryJobs)
 	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/refresh", s.refreshCategory)
+	s.Mux.HandleFunc("GET /api/v1/categories/{slug}/ai-configs", s.listAIConfigs)
+	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/ai-configs", s.createAIConfig)
+	s.Mux.HandleFunc("PUT /api/v1/categories/{slug}/ai-configs/{id}", s.updateAIConfig)
+	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/ai-configs/{id}", s.deleteAIConfig)
+	s.Mux.HandleFunc("PUT /api/v1/categories/{slug}/active-ai-config", s.setActiveAIConfig)
 
 	s.Mux.HandleFunc("POST /api/v1/ingest", s.ingest)
 	s.Mux.HandleFunc("GET /api/v1/ingest/jobs", s.listJobs)
@@ -452,6 +457,7 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		ChecklistID string `json:"checklist_id"`
+		ConfigID    string `json:"config_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -462,7 +468,8 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("analyze tender %s reg=%s → %s", id, t.RegNumber, s.Analizator.BaseURL)
-	if err := autoai.AnalyzeTender(r.Context(), s.Store, s.Control, s.Analizator, t, body.ChecklistID); err != nil {
+	opt := &autoai.AnalyzeOptions{ChecklistID: body.ChecklistID, ConfigID: body.ConfigID}
+	if err := autoai.AnalyzeTender(r.Context(), s.Store, s.Control, s.Analizator, t, opt); err != nil {
 		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "canceled") || strings.Contains(err.Error(), "cancelled") {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "AI-анализ остановлен"})
 			return
@@ -485,7 +492,15 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.Control.Status())
+	out := s.Control.Status()
+	azOK := s.Analizator != nil && s.Analizator.Enabled()
+	out["analizator_configured"] = azOK
+	if azOK {
+		out["analizator"] = "ok"
+	} else {
+		out["analizator"] = "disabled"
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
@@ -507,8 +522,16 @@ func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "нужно поле enabled или auto_ai"})
 		return
 	}
+	if on && (s.Analizator == nil || !s.Analizator.Enabled()) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "AI-анализатор не настроен (ANALIZATOR_URL)",
+		})
+		return
+	}
 	s.Control.SetAutoAI(on)
-	writeJSON(w, http.StatusOK, s.Control.Status())
+	out := s.Control.Status()
+	out["analizator_configured"] = s.Analizator != nil && s.Analizator.Enabled()
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) ingestPause(w http.ResponseWriter, r *http.Request) {
@@ -610,6 +633,157 @@ func (s *Server) deleteCustomer(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) stubList(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, []any{})
+}
+
+func (s *Server) listAIConfigs(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	list, err := s.Store.ListAIConfigs(r.Context(), cat.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"configs":             emptySlice(list),
+		"active_ai_config_id": cat.ActiveAIConfigID,
+	})
+}
+
+func (s *Server) createAIConfig(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		Name         string `json:"name"`
+		SystemPrompt string `json:"system_prompt"`
+		UserPrompt   string `json:"user_prompt"`
+		Rules        string `json:"rules"`
+		Activate     bool   `json:"activate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	cfg, err := s.Store.CreateAIConfig(r.Context(), cat.ID, body.Name, body.SystemPrompt, body.UserPrompt, body.Rules)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	wantActive := body.Activate || cat.ActiveAIConfigID == nil
+	if wantActive {
+		if s.Control.AutoAIEnabled() && cat.ActiveAIConfigID != nil {
+			// при Авто не меняем активную; новая конфиг просто сохраняется
+		} else {
+			_ = s.Store.SetCategoryActiveAIConfig(r.Context(), cat.ID, &cfg.ID)
+		}
+	}
+	writeJSON(w, http.StatusCreated, cfg)
+}
+
+func (s *Server) updateAIConfig(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	cur, err := s.Store.GetAIConfig(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if cur.CategoryID != cat.ID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "конфигурация другой категории"})
+		return
+	}
+	var body struct {
+		Name         string `json:"name"`
+		SystemPrompt string `json:"system_prompt"`
+		UserPrompt   string `json:"user_prompt"`
+		Rules        string `json:"rules"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	cfg, err := s.Store.UpdateAIConfig(r.Context(), id, body.Name, body.SystemPrompt, body.UserPrompt, body.Rules)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (s *Server) deleteAIConfig(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	cur, err := s.Store.GetAIConfig(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if cur.CategoryID != cat.ID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "конфигурация другой категории"})
+		return
+	}
+	if err := s.Store.DeleteAIConfig(r.Context(), id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) setActiveAIConfig(w http.ResponseWriter, r *http.Request) {
+	if s.Control.AutoAIEnabled() {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "нельзя менять конфигурацию при включённом Авто AI",
+		})
+		return
+	}
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		ConfigID *string `json:"config_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	var idPtr *uuid.UUID
+	if body.ConfigID != nil && strings.TrimSpace(*body.ConfigID) != "" {
+		id, err := uuid.Parse(strings.TrimSpace(*body.ConfigID))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		idPtr = &id
+	}
+	if err := s.Store.SetCategoryActiveAIConfig(r.Context(), cat.ID, idPtr); err != nil {
+		writeErr(w, err)
+		return
+	}
+	updated, _ := s.Store.GetCategoryBySlug(r.Context(), cat.Slug)
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func emptySlice[T any](v []T) []T {
