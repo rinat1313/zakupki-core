@@ -19,6 +19,7 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 	rows, err := s.Pool.Query(ctx, `
 		SELECT t.id,t.reg_number,t.source_site,t.law,t.customer_id,t.object_name,t.status,t.nmck,t.currency,
 		       t.published_at,t.updated_on_site,t.application_end,t.analysis_status,t.payload,t.created_at,t.updated_at,
+		       COALESCE(t.collect_pct,0), COALESCE(t.ai_pct,0),
 		       COALESCE(array_agg(DISTINCT c.slug) FILTER (WHERE c.slug IS NOT NULL), '{}'),
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed),0),
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='processed'),0),
@@ -47,7 +48,9 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 		var t Tender
 		var rec string
 		if err := rows.Scan(&t.ID, &t.RegNumber, &t.SourceSite, &t.Law, &t.CustomerID, &t.ObjectName, &t.Status, &t.NMCK, &t.Currency,
-			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt, &t.CategorySlugs,
+			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt,
+			&t.StoredCollectPct, &t.StoredAIPct,
+			&t.CategorySlugs,
 			&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
 			&t.IngestStatus, &t.AssessScore, &rec); err != nil {
 			return nil, err
@@ -60,8 +63,16 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 }
 
 func enrichTenderProgress(t *Tender) {
-	// Сбор
+	// Сбор: плавный % из БД во время работы, иначе вычисляем.
 	switch {
+	case t.IngestStatus == "running" || t.IngestStatus == "queued":
+		if t.StoredCollectPct > 0 {
+			t.CollectPct = t.StoredCollectPct
+		} else if t.DocsTotal > 0 {
+			t.CollectPct = 15 + int(float64(t.DocsProcessed)/float64(maxInt(t.DocsTotal, 1))*70)
+		} else {
+			t.CollectPct = 8
+		}
 	case t.DocsTotal > 0 && t.DocsUnprocessed == 0 && t.DocsErrors == 0:
 		t.CollectPct = 100
 		ok := true
@@ -70,53 +81,64 @@ func enrichTenderProgress(t *Tender) {
 		t.CollectPct = 100
 		ok := false
 		t.CollectOK = &ok
-	case t.DocsTotal > 0:
-		t.CollectPct = int(float64(t.DocsProcessed) / float64(t.DocsTotal) * 100)
-	case t.IngestStatus == "running" || t.IngestStatus == "queued":
-		t.CollectPct = 10
-	case t.IngestStatus == "error" || t.IngestStatus == "failed_analyze":
+	case t.IngestStatus == "ok":
+		// Парсер закончил карточку — сбор файлов завершён (обработка текста может быть частичной).
 		t.CollectPct = 100
+		if t.DocsErrors > 0 {
+			ok := false
+			t.CollectOK = &ok
+		} else {
+			ok := true
+			t.CollectOK = &ok
+		}
+	case t.IngestStatus == "error" || t.IngestStatus == "failed_analyze" || t.IngestStatus == "unsupported_source":
+		t.CollectPct = maxInt(t.StoredCollectPct, 30)
 		ok := false
 		t.CollectOK = &ok
-	case t.IngestStatus == "ok":
-		t.CollectPct = 100
-		ok := true
-		t.CollectOK = &ok
+	case t.DocsTotal > 0:
+		t.CollectPct = 20 + int(float64(t.DocsProcessed)/float64(t.DocsTotal)*75)
 	default:
-		t.CollectPct = 0
+		t.CollectPct = t.StoredCollectPct
 	}
 
-	// AI
+	// AI: во время анализа берём % из БД (обновляется по порциям LM Studio).
 	switch t.AnalysisStatus {
 	case "analyzed":
 		t.AIPct = 100
 		ok := true
-		if t.Recommendation == "skip" || t.Recommendation == "unknown" {
-			// skip — корректный итог, не ошибка процесса
-			ok = true
-		}
 		t.AIOK = &ok
 	case "other":
 		t.AIPct = 100
 		ok := false
 		t.AIOK = &ok
 	case "analyzing":
-		t.AIPct = 40
+		if t.StoredAIPct > 0 {
+			t.AIPct = t.StoredAIPct
+		} else {
+			t.AIPct = 5
+		}
 	default:
 		t.AIPct = 0
 	}
 
-	t.ReadyForAI = t.DocsTotal > 0 && t.DocsUnprocessed == 0 && t.DocsWithText > 0 &&
+	// Готов к AI: ingest ok (парсер ушёл дальше), есть хотя бы один текст — не ждём обработки всех файлов.
+	t.ReadyForAI = t.IngestStatus == "ok" && t.DocsWithText > 0 &&
 		(t.AnalysisStatus == "none" || t.AnalysisStatus == "")
 
+	incompleteDownload := t.IngestStatus == "running" || t.IngestStatus == "queued" ||
+		(t.IngestStatus != "ok" && t.IngestStatus != "" && t.IngestStatus != "error" && t.IngestStatus != "failed_analyze" && t.IngestStatus != "unsupported_source" && t.IngestStatus != "cancelled" && t.DocsTotal == 0) ||
+		(t.IngestStatus == "ok" && t.DocsTotal == 0)
+
 	switch {
+	case incompleteDownload || (t.IngestStatus == "running" || t.IngestStatus == "queued"):
+		t.CardTone = "pending"
 	case t.CollectOK != nil && !*t.CollectOK:
 		t.CardTone = "bad"
 	case t.AIOK != nil && !*t.AIOK:
 		t.CardTone = "bad"
 	case t.Recommendation == "skip" || t.AnalysisStatus == "irrelevant" || t.AnalysisStatus == "delete":
 		t.CardTone = "bad"
-	case t.CollectOK != nil && *t.CollectOK && t.DocsWithText > 0 && t.DocsUnprocessed == 0:
+	case t.CollectOK != nil && *t.CollectOK && t.DocsWithText > 0:
 		t.CardTone = "good"
 	case t.AnalysisStatus == "analyzed" && (t.Recommendation == "participate" || t.Recommendation == "caution"):
 		t.CardTone = "good"
@@ -125,16 +147,31 @@ func enrichTenderProgress(t *Tender) {
 	}
 }
 
-// NextTenderReadyForAI — карточка готова к авто-анализу (все доки обработаны, есть текст, AI ещё не делали).
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// NextTenderReadyForAI — ingest завершён (ok), есть текст; не ждём process_status всех документов.
 func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
 	var id uuid.UUID
 	err := s.Pool.QueryRow(ctx, `
 		SELECT t.id FROM tenders t
-		WHERE t.analysis_status IN ('none')
-		  AND EXISTS (SELECT 1 FROM documents d WHERE d.tender_id=t.id AND NOT d.removed)
-		  AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='unprocessed')
-		  AND EXISTS (SELECT 1 FROM documents d WHERE d.tender_id=t.id AND NOT d.removed
-		              AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0)
+		WHERE t.analysis_status = 'none'
+		  AND EXISTS (
+		    SELECT 1 FROM ingest_job_items i
+		    WHERE i.reg_number=t.reg_number AND i.status='ok'
+		      AND i.updated_at = (
+		        SELECT max(i2.updated_at) FROM ingest_job_items i2 WHERE i2.reg_number=t.reg_number
+		      )
+		  )
+		  AND EXISTS (
+		    SELECT 1 FROM documents d
+		    WHERE d.tender_id=t.id AND NOT d.removed
+		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
+		  )
 		ORDER BY t.updated_at ASC
 		LIMIT 1`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -178,11 +215,14 @@ func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 		  COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=$1 AND NOT d.removed AND d.process_error<>''),0),
 		  COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=$2 ORDER BY i.updated_at DESC LIMIT 1),''),
 		  a.score,
-		  COALESCE(a.details->>'recommendation', '')
-		FROM (SELECT 1) _
-		LEFT JOIN tender_assessments a ON a.tender_id=$1`, t.ID, t.RegNumber).
+		  COALESCE(a.details->>'recommendation', ''),
+		  COALESCE(t.collect_pct,0),
+		  COALESCE(t.ai_pct,0)
+		FROM tenders t
+		LEFT JOIN tender_assessments a ON a.tender_id=t.id
+		WHERE t.id=$1`, t.ID, t.RegNumber).
 		Scan(&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &t.Recommendation)
+			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.StoredCollectPct, &t.StoredAIPct)
 	if err != nil {
 		return err
 	}

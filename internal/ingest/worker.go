@@ -35,9 +35,14 @@ func (w *Worker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			w.tick(ctx)
+			w.TickOnce(ctx)
 		}
 	}
+}
+
+// TickOnce — одна попытка взять задачу (для динамического пула).
+func (w *Worker) TickOnce(ctx context.Context) {
+	w.tick(ctx)
 }
 
 func (w *Worker) tick(ctx context.Context) {
@@ -53,6 +58,13 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 	w.logItem(ctx, job, item, "start", "начало обработки %s (%s)", item.RegNumber, item.SourceSite)
+	if existing, err := w.Store.FindTenderByKey(ctx, item.RegNumber, normalizeSite(item.SourceSite)); err == nil {
+		pct := 5
+		_ = w.Store.SetTenderProgress(ctx, existing.ID, &pct, nil)
+	} else if existing, err := w.Store.FindTenderByKey(ctx, item.RegNumber, "https://zakupki.gov.ru"); err == nil {
+		pct := 5
+		_ = w.Store.SetTenderProgress(ctx, existing.ID, &pct, nil)
+	}
 
 	csvSite := normalizeSite(item.SourceSite)
 	if w.Parser == nil || !w.Parser.Enabled() {
@@ -144,10 +156,14 @@ func (w *Worker) tick(ctx context.Context) {
 		return
 	}
 
+	startPct := 15
+	_ = w.Store.SetTenderProgress(ctx, tender.ID, &startPct, nil)
+
 	var urls []string
+	totalDocs := len(res.Documents)
 	for i, d := range res.Documents {
 		urls = append(urls, d.SourceURL)
-		w.logItem(ctx, job, item, "doc", "[%d/%d] %s → %s %s", i+1, len(res.Documents), d.Filename, d.ProcessStatus, d.ProcessError)
+		w.logItem(ctx, job, item, "doc", "[%d/%d] %s → %s %s", i+1, totalDocs, d.Filename, d.ProcessStatus, d.ProcessError)
 		doc := store.Document{
 			TenderID: tender.ID, UID: d.UID, Filename: d.Filename, SourceURL: d.SourceURL,
 			GroupTitle: d.GroupTitle, Edition: d.Edition, ProcessStatus: d.ProcessStatus,
@@ -160,8 +176,14 @@ func (w *Worker) tick(ctx context.Context) {
 		if _, _, err := w.Store.UpsertDocument(ctx, doc); err != nil {
 			w.logItem(ctx, job, item, "warn", "doc upsert: %v", err)
 		}
+		if totalDocs > 0 {
+			pct := 15 + int(float64(i+1)/float64(totalDocs)*80)
+			_ = w.Store.SetTenderProgress(ctx, tender.ID, &pct, nil)
+		}
 	}
 	_ = w.Store.MarkMissingDocuments(ctx, tender.ID, urls)
+	donePct := 100
+	_ = w.Store.SetTenderProgress(ctx, tender.ID, &donePct, nil)
 	tid := tender.ID
 	_ = w.Store.FinishItem(ctx, item.ID, "ok", "", &tid)
 	w.logItem(ctx, job, item, "done", "сохранено в БД, документов: %d", len(res.Documents))

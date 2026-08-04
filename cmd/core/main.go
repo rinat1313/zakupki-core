@@ -6,8 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,18 +49,56 @@ func main() {
 	}
 	ctrl := control.New()
 
-	ingestWorkers := envInt("INGEST_WORKERS", 3)
-	if ingestWorkers < 1 {
-		ingestWorkers = 1
-	}
-	if ingestWorkers > 16 {
-		ingestWorkers = 16
-	}
-	log.Printf("ingest workers: %d (FOR UPDATE SKIP LOCKED)", ingestWorkers)
-	for i := 0; i < ingestWorkers; i++ {
+	// Пул воркеров: активных = max(1, 10% очереди), потолок 32.
+	const maxSlots = 32
+	var desired atomic.Int64
+	desired.Store(1)
+	for i := 0; i < maxSlots; i++ {
+		id := i
 		w := &ingest.Worker{Store: st, Parser: parser, Control: ctrl, Log: log.Default()}
-		go w.Run(ctx)
+		go func() {
+			t := time.NewTicker(2 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if int64(id) >= desired.Load() {
+						continue
+					}
+					w.TickOnce(ctx)
+				}
+			}
+		}()
 	}
+	go func() {
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				n, err := st.CountQueuedIngest(ctx)
+				if err != nil {
+					continue
+				}
+				want := n / 10
+				if want < 1 {
+					want = 1
+				}
+				if want > maxSlots {
+					want = maxSlots
+				}
+				prev := desired.Swap(int64(want))
+				if prev != int64(want) {
+					log.Printf("ingest workers desired=%d (queue=%d, 10%%)", want, n)
+				}
+			}
+		}
+	}()
+	log.Printf("ingest worker pool: up to %d slots, scale = max(1, queue/10)", maxSlots)
 
 	az := analizator.New(os.Getenv("ANALIZATOR_URL"))
 	if az.Enabled() {
@@ -95,16 +132,4 @@ func main() {
 	shCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
 	defer c()
 	_ = httpSrv.Shutdown(shCtx)
-}
-
-func envInt(k string, def int) int {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
 }

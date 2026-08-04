@@ -34,10 +34,23 @@ func (c *Client) Enabled() bool {
 
 // AnalyzeRequest — тело POST /api/v1/analyze.
 type AnalyzeRequest struct {
-	RegNumber   string `json:"reg_number,omitempty"`
-	Text        string `json:"text,omitempty"`
-	ChecklistID string `json:"checklist_id,omitempty"`
-	Title       string `json:"title,omitempty"`
+	RegNumber    string `json:"reg_number,omitempty"`
+	Text         string `json:"text,omitempty"`
+	ChecklistID  string `json:"checklist_id,omitempty"`
+	Title        string `json:"title,omitempty"`
+	ConfigName   string `json:"config_name,omitempty"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	UserPrompt   string `json:"user_prompt,omitempty"`
+	Rules        string `json:"rules,omitempty"`
+}
+
+// ProgressInfo — прогресс дозированного анализа.
+type ProgressInfo struct {
+	RegNumber  string `json:"reg_number"`
+	Percent    int    `json:"percent"`
+	DosesDone  int    `json:"doses_done"`
+	DosesTotal int    `json:"doses_total"`
+	Phase      string `json:"phase"`
 }
 
 // ItemResult — пункт чек-листа.
@@ -128,6 +141,34 @@ func (c *Client) Analyze(ctx context.Context, in AnalyzeRequest) (*Result, error
 	var out Result
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("analizator decode: %w", err)
+	}
+	return &out, nil
+}
+
+// Progress читает GET /api/v1/analyze/progress/{reg}.
+func (c *Client) Progress(ctx context.Context, reg string) (*ProgressInfo, error) {
+	if !c.Enabled() || strings.TrimSpace(reg) == "" {
+		return nil, fmt.Errorf("no progress")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/v1/analyze/progress/"+reg, nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode >= 300 {
+		return nil, fmt.Errorf("progress HTTP %d", res.StatusCode)
+	}
+	var out ProgressInfo
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
 	}
 	return &out, nil
 }

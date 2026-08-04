@@ -2,12 +2,14 @@ package autoai
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rinat1313/zakupki-core/internal/analizator"
 	"github.com/rinat1313/zakupki-core/internal/control"
 	"github.com/rinat1313/zakupki-core/internal/store"
@@ -27,7 +29,7 @@ func (w *Worker) Run(ctx context.Context) {
 		w.Log = log.Default()
 	}
 	if w.Interval <= 0 {
-		w.Interval = 5 * time.Second
+		w.Interval = 3 * time.Second
 	}
 	t := time.NewTicker(w.Interval)
 	defer t.Stop()
@@ -53,21 +55,31 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 	tender, err := w.Store.NextTenderReadyForAI(ctx)
 	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			w.Log.Printf("auto-ai: next tender: %v", err)
+		}
 		return
 	}
 	if err := w.Store.MarkAnalyzing(ctx, tender.ID); err != nil {
+		w.Log.Printf("auto-ai: claim %s: %v", tender.RegNumber, err)
 		return
 	}
 	w.Log.Printf("auto-ai: start %s", tender.RegNumber)
-	if err := AnalyzeTender(ctx, w.Store, w.Control, w.Analizator, tender, ""); err != nil {
+	if err := AnalyzeTender(ctx, w.Store, w.Control, w.Analizator, tender, nil); err != nil {
 		w.Log.Printf("auto-ai: %s error: %v", tender.RegNumber, err)
 		return
 	}
 	w.Log.Printf("auto-ai: done %s", tender.RegNumber)
 }
 
+// AnalyzeOptions — опциональный чек-лист / конфиг.
+type AnalyzeOptions struct {
+	ConfigID    string
+	ChecklistID string
+}
+
 // AnalyzeTender — общая логика ручного и авто-анализа.
-func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controller, az *analizator.Client, t *store.Tender, checklistID string) error {
+func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controller, az *analizator.Client, t *store.Tender, opt *AnalyzeOptions) error {
 	docs, err := st.ListDocuments(ctx, t.ID, true)
 	if err != nil {
 		return err
@@ -89,11 +101,27 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 		_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "other"})
 		return errNoText
 	}
-	if len(names) > 0 {
-		corpus = "Документы в анализе (" + strconv.Itoa(len(names)) + "):\n- " + strings.Join(names, "\n- ") +
-			"\n\nПосле всех порций документов дай ИТОГОВЫЙ ответ: да или нет (участие самозанятого) и почему.\n\n" + corpus
+
+	cfg, _ := st.ActiveAIConfigForTender(ctx, t.ID)
+	if opt != nil && strings.TrimSpace(opt.ConfigID) != "" {
+		if id, perr := uuid.Parse(opt.ConfigID); perr == nil {
+			if c, gerr := st.GetAIConfig(ctx, id); gerr == nil {
+				cfg = c
+			}
+		}
 	}
 
+	focus := "Оцени закупку по возможности участия самозанятого"
+	if cfg != nil && strings.TrimSpace(cfg.UserPrompt) != "" {
+		focus = strings.TrimSpace(cfg.UserPrompt)
+	}
+	if len(names) > 0 {
+		corpus = "Документы в анализе (" + strconv.Itoa(len(names)) + "):\n- " + strings.Join(names, "\n- ") +
+			"\n\nПосле всех порций документов дай ИТОГОВЫЙ ответ по целевому вопросу и почему.\n\n" + corpus
+	}
+
+	startPct := 5
+	_ = st.SetTenderProgress(ctx, t.ID, nil, &startPct)
 	_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "analyzing"})
 
 	analyzeCtx, ok := ctrl.BeginAnalyze(ctx)
@@ -102,12 +130,54 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 	}
 	defer ctrl.EndAnalyze()
 
-	res, err := az.Analyze(analyzeCtx, analizator.AnalyzeRequest{
-		RegNumber:   t.RegNumber,
-		Text:        corpus,
-		ChecklistID: checklistID,
-		Title:       t.ObjectName,
-	})
+	req := analizator.AnalyzeRequest{
+		RegNumber:  t.RegNumber,
+		Text:       corpus,
+		Title:      t.ObjectName,
+		UserPrompt: focus,
+	}
+	if opt != nil {
+		req.ChecklistID = opt.ChecklistID
+	}
+	if cfg != nil {
+		req.ChecklistID = cfg.ID.String()
+		req.ConfigName = cfg.Name
+		req.SystemPrompt = cfg.SystemPrompt
+		req.UserPrompt = cfg.UserPrompt
+		req.Rules = cfg.Rules
+		if strings.TrimSpace(req.UserPrompt) == "" {
+			req.UserPrompt = focus
+		}
+	}
+
+	progCtx, progCancel := context.WithCancel(analyzeCtx)
+	defer progCancel()
+	go func() {
+		ticker := time.NewTicker(700 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progCtx.Done():
+				return
+			case <-ticker.C:
+				p, err := az.Progress(progCtx, t.RegNumber)
+				if err != nil || p == nil {
+					continue
+				}
+				pct := p.Percent
+				if pct < 5 {
+					pct = 5
+				}
+				if pct > 95 {
+					pct = 95
+				}
+				_ = st.SetTenderProgress(context.Background(), t.ID, nil, &pct)
+			}
+		}
+	}()
+
+	res, err := az.Analyze(analyzeCtx, req)
+	progCancel()
 	if err != nil {
 		if analyzeCtx.Err() != nil {
 			_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "none"})
@@ -116,6 +186,9 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 		_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "other"})
 		return err
 	}
+
+	done := 100
+	_ = st.SetTenderProgress(ctx, t.ID, nil, &done)
 
 	score := res.Score
 	summary := res.Summary
