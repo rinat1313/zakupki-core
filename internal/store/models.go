@@ -73,6 +73,7 @@ type Tender struct {
 	IngestStatus    string   `json:"ingest_status,omitempty"`
 	Recommendation  string   `json:"recommendation,omitempty"`
 	AssessScore     *float64 `json:"assess_score,omitempty"`
+	AssessSummary   string   `json:"assess_summary,omitempty"`
 	ReadyForAI      bool     `json:"ready_for_ai"`
 	CardTone        string   `json:"card_tone,omitempty"` // good|bad|pending|neutral
 	StoredCollectPct int     `json:"-"`
