@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -107,36 +108,59 @@ func main() {
 		log.Printf("analizator: disabled")
 	}
 
-	// Синхронизация ёмкости AI с пулом LM Studio.
+	analyzeMax := 4
+	if v := os.Getenv("ANALYZE_MAX_PARALLEL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			analyzeMax = n
+		}
+	}
+	// Стартуем сразу с целевой ёмкостью; дальше подстраиваем по живому пулу LM.
+	ctrl.SetAnalyzeCapacity(analyzeMax)
+	log.Printf("analyze capacity: start=%d (ANALYZE_MAX_PARALLEL)", analyzeMax)
+
+	syncAnalyzeCapacity := func() {
+		if !az.Enabled() {
+			ctrl.SetAnalyzeCapacity(1)
+			return
+		}
+		st, err := az.PoolStatus(ctx)
+		if err != nil || st == nil {
+			return
+		}
+		n := st.MaxParallel
+		if n < 1 {
+			n = st.Healthy
+		}
+		if n < 1 {
+			// пул временно недоступен — не роняем ёмкость в 1, оставляем целевую
+			n = analyzeMax
+		}
+		if n > analyzeMax {
+			n = analyzeMax
+		}
+		ctrl.SetAnalyzeCapacity(n)
+	}
+	syncAnalyzeCapacity()
+
+	// Синхронизация ёмкости AI с пулом LM Studio (чаще — быстрее занять слоты).
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if !az.Enabled() {
-					ctrl.SetAnalyzeCapacity(1)
-					continue
+				prev := ctrl.AnalyzeCapacity()
+				syncAnalyzeCapacity()
+				if cur := ctrl.AnalyzeCapacity(); cur != prev {
+					log.Printf("analyze capacity: %d → %d (lm pool)", prev, cur)
 				}
-				st, err := az.PoolStatus(ctx)
-				if err != nil || st == nil {
-					continue
-				}
-				n := st.MaxParallel
-				if n < 1 {
-					n = st.Healthy
-				}
-				if n < 1 {
-					n = 1
-				}
-				ctrl.SetAnalyzeCapacity(n)
 			}
 		}
 	}()
 
-	auto := &autoai.Worker{Store: st, Control: ctrl, Analizator: az, Log: log.Default()}
+	auto := &autoai.Worker{Store: st, Control: ctrl, Analizator: az, Log: log.Default(), Interval: time.Second}
 	go auto.Run(ctx)
 
 	srv := httpapi.New(st, az, ctrl)

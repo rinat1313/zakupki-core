@@ -156,9 +156,16 @@ func maxInt(a, b int) int {
 }
 
 // NextTenderReadyForAI — ingest завершён (ok), есть текст; не ждём process_status всех документов.
+// FOR UPDATE SKIP LOCKED — безопасно при нескольких параллельных воркерах AI.
 func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
 	var id uuid.UUID
-	err := s.Pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT t.id FROM tenders t
 		WHERE t.analysis_status = 'none'
 		  AND EXISTS (
@@ -174,11 +181,22 @@ func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
 		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
 		  )
 		ORDER BY t.updated_at ASC
+		FOR UPDATE SKIP LOCKED
 		LIMIT 1`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
+		return nil, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE tenders SET analysis_status='analyzing', updated_at=now() WHERE id=$1 AND analysis_status='none'`, id)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return s.GetTender(ctx, id)
