@@ -67,15 +67,10 @@ func (w *Worker) tick(ctx context.Context) {
 			}
 			return
 		}
-		if err := w.Store.MarkAnalyzing(ctx, tender.ID); err != nil {
-			release()
-			w.Log.Printf("auto-ai: claim %s: %v", tender.RegNumber, err)
-			continue
-		}
 		t := tender
 		rel := release
 		aCtx := analyzeCtx
-		w.Log.Printf("auto-ai: start %s (parallel %d)", t.RegNumber, i+1)
+		w.Log.Printf("auto-ai: start %s (slot %d/%d)", t.RegNumber, i+1, free)
 		go func() {
 			opt := &AnalyzeOptions{PreCtx: aCtx, Release: rel}
 			if err := AnalyzeTender(ctx, w.Store, w.Control, w.Analizator, t, opt); err != nil {

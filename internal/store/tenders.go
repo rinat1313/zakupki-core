@@ -28,7 +28,8 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_error<>''),0),
 		       COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=t.reg_number ORDER BY i.updated_at DESC LIMIT 1),''),
 		       a.score,
-		       COALESCE(a.details->>'recommendation', '')
+		       COALESCE(a.details->>'recommendation', ''),
+		       COALESCE(a.summary, '')
 		FROM tenders t
 		LEFT JOIN tender_categories tc ON tc.tender_id=t.id
 		LEFT JOIN categories c ON c.id=tc.category_id
@@ -36,7 +37,7 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 		WHERE ($1='' OR c.slug=$1)
 		  AND ($2='' OR t.reg_number ILIKE '%'||$2||'%' OR t.object_name ILIKE '%'||$2||'%')
 		  AND ($3='' OR t.analysis_status::text=$3)
-		GROUP BY t.id, a.score, a.details
+		GROUP BY t.id, a.score, a.details, a.summary
 		ORDER BY t.application_end NULLS LAST, t.updated_at DESC
 		LIMIT $4`, categorySlug, strings.TrimSpace(q), strings.TrimSpace(status), limit)
 	if err != nil {
@@ -52,7 +53,7 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 			&t.StoredCollectPct, &t.StoredAIPct,
 			&t.CategorySlugs,
 			&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &rec); err != nil {
+			&t.IngestStatus, &t.AssessScore, &rec, &t.AssessSummary); err != nil {
 			return nil, err
 		}
 		t.Recommendation = rec
@@ -155,9 +156,16 @@ func maxInt(a, b int) int {
 }
 
 // NextTenderReadyForAI — ingest завершён (ok), есть текст; не ждём process_status всех документов.
+// FOR UPDATE SKIP LOCKED — безопасно при нескольких параллельных воркерах AI.
 func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
 	var id uuid.UUID
-	err := s.Pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT t.id FROM tenders t
 		WHERE t.analysis_status = 'none'
 		  AND EXISTS (
@@ -173,11 +181,22 @@ func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
 		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
 		  )
 		ORDER BY t.updated_at ASC
+		FOR UPDATE SKIP LOCKED
 		LIMIT 1`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
+		return nil, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE tenders SET analysis_status='analyzing', updated_at=now() WHERE id=$1 AND analysis_status='none'`, id)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return s.GetTender(ctx, id)
@@ -216,13 +235,14 @@ func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 		  COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=$2 ORDER BY i.updated_at DESC LIMIT 1),''),
 		  a.score,
 		  COALESCE(a.details->>'recommendation', ''),
+		  COALESCE(a.summary, ''),
 		  COALESCE(t.collect_pct,0),
 		  COALESCE(t.ai_pct,0)
 		FROM tenders t
 		LEFT JOIN tender_assessments a ON a.tender_id=t.id
 		WHERE t.id=$1`, t.ID, t.RegNumber).
 		Scan(&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.StoredCollectPct, &t.StoredAIPct)
+			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.AssessSummary, &t.StoredCollectPct, &t.StoredAIPct)
 	if err != nil {
 		return err
 	}
