@@ -531,6 +531,19 @@ func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
 	s.Control.SetAutoAI(on)
 	out := s.Control.Status()
 	out["analizator_configured"] = s.Analizator != nil && s.Analizator.Enabled()
+	if on {
+		// Снова поставить в очередь карточки, упавшие в other из‑за LMS/сети.
+		if n, err := s.Store.RequeueFailedAnalyses(r.Context()); err != nil {
+			log.Printf("auto-ai enable: requeue failed: %v", err)
+		} else if n > 0 {
+			log.Printf("auto-ai enable: requeued %d failed tenders → none", n)
+			out["requeued_failed"] = n
+		}
+		if n, err := s.Store.CountReadyForAI(r.Context()); err == nil {
+			out["ready_for_ai"] = n
+			log.Printf("auto-ai enable: ready_for_ai=%d", n)
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
