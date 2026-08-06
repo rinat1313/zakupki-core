@@ -151,14 +151,14 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	items, err := ingest.ParseCSV(file)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	name := ""
 	if hdr != nil {
 		name = hdr.Filename
+	}
+	items, err := ingest.ParseUpload(name, file)
+	if err != nil {
+		writeErr(w, err)
+		return
 	}
 	// New upload resumes collection if it was stopped/paused.
 	s.Control.ResumeIngest()
