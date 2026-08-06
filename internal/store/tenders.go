@@ -260,13 +260,14 @@ func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 		  COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=$2 ORDER BY i.updated_at DESC LIMIT 1),''),
 		  a.score,
 		  COALESCE(a.details->>'recommendation', ''),
+		  COALESCE(a.summary, ''),
 		  COALESCE(t.collect_pct,0),
 		  COALESCE(t.ai_pct,0)
 		FROM tenders t
 		LEFT JOIN tender_assessments a ON a.tender_id=t.id
 		WHERE t.id=$1`, t.ID, t.RegNumber).
 		Scan(&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.StoredCollectPct, &t.StoredAIPct)
+			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.AssessSummary, &t.StoredCollectPct, &t.StoredAIPct)
 	if err != nil {
 		return err
 	}
