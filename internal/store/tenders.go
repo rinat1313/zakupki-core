@@ -28,15 +28,20 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_error<>''),0),
 		       COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=t.reg_number ORDER BY i.updated_at DESC LIMIT 1),''),
 		       a.score,
-		       COALESCE(a.details->>'recommendation', '')
+		       COALESCE(a.details->>'recommendation', ''),
+		       COALESCE(a.summary, ''),
+		       COALESCE(cu.inn, ''),
+		       COALESCE(NULLIF(cu.short_name,''), NULLIF(cu.full_name,''), '')
 		FROM tenders t
 		LEFT JOIN tender_categories tc ON tc.tender_id=t.id
 		LEFT JOIN categories c ON c.id=tc.category_id
 		LEFT JOIN tender_assessments a ON a.tender_id=t.id
+		LEFT JOIN customers cu ON cu.id=t.customer_id
 		WHERE ($1='' OR c.slug=$1)
-		  AND ($2='' OR t.reg_number ILIKE '%'||$2||'%' OR t.object_name ILIKE '%'||$2||'%')
+		  AND ($2='' OR t.reg_number ILIKE '%'||$2||'%' OR t.object_name ILIKE '%'||$2||'%'
+		       OR cu.inn ILIKE '%'||$2||'%' OR cu.full_name ILIKE '%'||$2||'%' OR cu.short_name ILIKE '%'||$2||'%')
 		  AND ($3='' OR t.analysis_status::text=$3)
-		GROUP BY t.id, a.score, a.details
+		GROUP BY t.id, a.score, a.details, a.summary, cu.inn, cu.short_name, cu.full_name
 		ORDER BY t.application_end NULLS LAST, t.updated_at DESC
 		LIMIT $4`, categorySlug, strings.TrimSpace(q), strings.TrimSpace(status), limit)
 	if err != nil {
@@ -52,7 +57,7 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 			&t.StoredCollectPct, &t.StoredAIPct,
 			&t.CategorySlugs,
 			&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &rec); err != nil {
+			&t.IngestStatus, &t.AssessScore, &rec, &t.AssessSummary, &t.CustomerINN, &t.CustomerName); err != nil {
 			return nil, err
 		}
 		t.Recommendation = rec
@@ -204,6 +209,45 @@ func (s *Store) RequeueStuckAnalyzing(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// RequeueFailedAnalyses — вернуть failed («other») в очередь Auto-AI, если есть текст документов.
+// Без этого после сбоя LMS/analizator карточки навсегда выпадают из NextTenderReadyForAI.
+func (s *Store) RequeueFailedAnalyses(ctx context.Context) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE tenders t
+		SET analysis_status='none', updated_at=now()
+		WHERE t.analysis_status = 'other'
+		  AND EXISTS (
+		    SELECT 1 FROM documents d
+		    WHERE d.tender_id=t.id AND NOT d.removed
+		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
+		  )`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// CountReadyForAI — сколько карточек Auto-AI сможет взять прямо сейчас.
+func (s *Store) CountReadyForAI(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM tenders t
+		WHERE t.analysis_status = 'none'
+		  AND EXISTS (
+		    SELECT 1 FROM ingest_job_items i
+		    WHERE i.reg_number=t.reg_number AND i.status='ok'
+		      AND i.updated_at = (
+		        SELECT max(i2.updated_at) FROM ingest_job_items i2 WHERE i2.reg_number=t.reg_number
+		      )
+		  )
+		  AND EXISTS (
+		    SELECT 1 FROM documents d
+		    WHERE d.tender_id=t.id AND NOT d.removed
+		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
+		  )`).Scan(&n)
+	return n, err
+}
+
 // EnrichTenderUI заполняет прогресс/тон для одной карточки (модалка).
 func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 	err := s.Pool.QueryRow(ctx, `
@@ -216,13 +260,14 @@ func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 		  COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=$2 ORDER BY i.updated_at DESC LIMIT 1),''),
 		  a.score,
 		  COALESCE(a.details->>'recommendation', ''),
+		  COALESCE(a.summary, ''),
 		  COALESCE(t.collect_pct,0),
 		  COALESCE(t.ai_pct,0)
 		FROM tenders t
 		LEFT JOIN tender_assessments a ON a.tender_id=t.id
 		WHERE t.id=$1`, t.ID, t.RegNumber).
 		Scan(&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.StoredCollectPct, &t.StoredAIPct)
+			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.AssessSummary, &t.StoredCollectPct, &t.StoredAIPct)
 	if err != nil {
 		return err
 	}

@@ -40,6 +40,11 @@ func main() {
 	} else if n > 0 {
 		log.Printf("requeued %d stuck analyzing tenders", n)
 	}
+	if n, err := st.RequeueFailedAnalyses(ctx); err != nil {
+		log.Printf("requeue failed analyses: %v", err)
+	} else if n > 0 {
+		log.Printf("requeued %d failed (other) tenders with document text → none", n)
+	}
 
 	parser := parserclient.New(os.Getenv("PARSER_URL"))
 	if parser.Enabled() {
