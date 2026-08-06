@@ -175,11 +175,13 @@ func (c *Client) Progress(ctx context.Context, reg string) (*ProgressInfo, error
 
 // PoolStatus — GET /api/v1/lm/pool.
 type PoolStatus struct {
-	Total       int `json:"total"`
-	Healthy     int `json:"healthy"`
-	Busy        int `json:"busy"`
-	Available   int `json:"available"`
-	MaxParallel int `json:"max_parallel"`
+	Total        int `json:"total"`
+	Healthy      int `json:"healthy"`
+	Busy         int `json:"busy"`
+	Available    int `json:"available"`
+	MaxParallel  int `json:"max_parallel"`
+	Hosts        int `json:"hosts"`
+	HealthyHosts int `json:"healthy_hosts"`
 }
 
 func (c *Client) PoolStatus(ctx context.Context) (*PoolStatus, error) {

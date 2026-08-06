@@ -495,8 +495,22 @@ func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
 	out := s.Control.Status()
 	azOK := s.Analizator != nil && s.Analizator.Enabled()
 	out["analizator_configured"] = azOK
+	out["lm_healthy"] = 0
+	out["lm_hosts"] = 0
 	if azOK {
 		out["analizator"] = "ok"
+		if pool, err := s.Analizator.PoolStatus(r.Context()); err == nil && pool != nil {
+			// Уникальные живые LM Studio (не слоты concurrent).
+			n := pool.HealthyHosts
+			if n == 0 && pool.Healthy > 0 {
+				// старый analizator без healthy_hosts
+				n = 1
+			}
+			out["lm_healthy"] = n
+			out["lm_hosts"] = pool.Hosts
+			out["lm_slots_healthy"] = pool.Healthy
+			out["lm_max_parallel"] = pool.MaxParallel
+		}
 	} else {
 		out["analizator"] = "disabled"
 	}
