@@ -113,11 +113,17 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 			texts = append(texts, "### Документ: "+label+"\n"+strings.TrimSpace(*d.TextContent))
 		}
 	}
-	corpus := analizator.BuildCorpus(t.ObjectName, t.Law, t.Status, t.NMCK, texts)
-	if corpus == "" {
+	// Без текста документов — не гоняем в LLM «пустой» corpus из одной шапки карточки.
+	if len(texts) == 0 {
 		_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "other"})
 		return errNoText
 	}
+	corpus := analizator.BuildCorpus(t.ObjectName, t.Law, t.Status, t.NMCK, texts)
+	if strings.TrimSpace(corpus) == "" {
+		_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "other"})
+		return errNoText
+	}
+	log.Printf("analyze %s: docs_with_text=%d corpus_runes=%d", t.RegNumber, len(texts), len([]rune(corpus)))
 
 	cfg, _ := st.ActiveAIConfigForTender(ctx, t.ID)
 	if opt != nil && strings.TrimSpace(opt.ConfigID) != "" {

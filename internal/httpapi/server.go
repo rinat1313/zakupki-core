@@ -495,8 +495,22 @@ func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
 	out := s.Control.Status()
 	azOK := s.Analizator != nil && s.Analizator.Enabled()
 	out["analizator_configured"] = azOK
+	out["lm_healthy"] = 0
+	out["lm_hosts"] = 0
 	if azOK {
 		out["analizator"] = "ok"
+		if pool, err := s.Analizator.PoolStatus(r.Context()); err == nil && pool != nil {
+			// Уникальные живые LM Studio (не слоты concurrent).
+			n := pool.HealthyHosts
+			if n == 0 && pool.Healthy > 0 {
+				// старый analizator без healthy_hosts
+				n = 1
+			}
+			out["lm_healthy"] = n
+			out["lm_hosts"] = pool.Hosts
+			out["lm_slots_healthy"] = pool.Healthy
+			out["lm_max_parallel"] = pool.MaxParallel
+		}
 	} else {
 		out["analizator"] = "disabled"
 	}
@@ -531,6 +545,19 @@ func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
 	s.Control.SetAutoAI(on)
 	out := s.Control.Status()
 	out["analizator_configured"] = s.Analizator != nil && s.Analizator.Enabled()
+	if on {
+		// Снова поставить в очередь карточки, упавшие в other из‑за LMS/сети.
+		if n, err := s.Store.RequeueFailedAnalyses(r.Context()); err != nil {
+			log.Printf("auto-ai enable: requeue failed: %v", err)
+		} else if n > 0 {
+			log.Printf("auto-ai enable: requeued %d failed tenders → none", n)
+			out["requeued_failed"] = n
+		}
+		if n, err := s.Store.CountReadyForAI(r.Context()); err == nil {
+			out["ready_for_ai"] = n
+			log.Printf("auto-ai enable: ready_for_ai=%d", n)
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 

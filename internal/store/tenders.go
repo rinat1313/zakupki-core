@@ -204,6 +204,45 @@ func (s *Store) RequeueStuckAnalyzing(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// RequeueFailedAnalyses — вернуть failed («other») в очередь Auto-AI, если есть текст документов.
+// Без этого после сбоя LMS/analizator карточки навсегда выпадают из NextTenderReadyForAI.
+func (s *Store) RequeueFailedAnalyses(ctx context.Context) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `
+		UPDATE tenders t
+		SET analysis_status='none', updated_at=now()
+		WHERE t.analysis_status = 'other'
+		  AND EXISTS (
+		    SELECT 1 FROM documents d
+		    WHERE d.tender_id=t.id AND NOT d.removed
+		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
+		  )`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// CountReadyForAI — сколько карточек Auto-AI сможет взять прямо сейчас.
+func (s *Store) CountReadyForAI(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM tenders t
+		WHERE t.analysis_status = 'none'
+		  AND EXISTS (
+		    SELECT 1 FROM ingest_job_items i
+		    WHERE i.reg_number=t.reg_number AND i.status='ok'
+		      AND i.updated_at = (
+		        SELECT max(i2.updated_at) FROM ingest_job_items i2 WHERE i2.reg_number=t.reg_number
+		      )
+		  )
+		  AND EXISTS (
+		    SELECT 1 FROM documents d
+		    WHERE d.tender_id=t.id AND NOT d.removed
+		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
+		  )`).Scan(&n)
+	return n, err
+}
+
 // EnrichTenderUI заполняет прогресс/тон для одной карточки (модалка).
 func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 	err := s.Pool.QueryRow(ctx, `
