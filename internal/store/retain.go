@@ -79,11 +79,20 @@ func (s *Store) UnretainTender(ctx context.Context, id uuid.UUID) (*Tender, erro
 }
 
 type SyncSearchPoolResult struct {
-	RemovedFromPool int        `json:"removed_from_pool"`
-	KeptRetained    int        `json:"kept_retained"`
-	Deleted         int        `json:"deleted"`
-	Enqueued        int        `json:"enqueued"`
-	Job             *IngestJob `json:"job,omitempty"`
+	RemovedFromPool     int        `json:"removed_from_pool"`
+	KeptRetained        int        `json:"kept_retained"`
+	Deleted             int        `json:"deleted"`
+	Enqueued            int        `json:"enqueued"`
+	SkippedSameVersion  bool       `json:"skipped_same_version,omitempty"`
+	SyncedConfigVersion int64      `json:"synced_config_version"`
+	Job                 *IngestJob `json:"job,omitempty"`
+}
+
+type SyncSearchPoolOpts struct {
+	Items         []struct{ Reg, Site string }
+	Enqueue       bool
+	SourceName    string
+	ConfigVersion int64 // 0 = always apply
 }
 
 // SyncSearchPool replaces the searcher-managed membership of a category.
@@ -92,6 +101,29 @@ type SyncSearchPoolResult struct {
 //   - if not retained and no other categories → deleted
 // When enqueue=true, creates an ingest job for the new pool items.
 func (s *Store) SyncSearchPool(ctx context.Context, categoryID uuid.UUID, items []struct{ Reg, Site string }, enqueue bool, sourceName string) (*SyncSearchPoolResult, error) {
+	return s.SyncSearchPoolOpts(ctx, categoryID, SyncSearchPoolOpts{
+		Items: items, Enqueue: enqueue, SourceName: sourceName,
+	})
+}
+
+func (s *Store) SyncSearchPoolOpts(ctx context.Context, categoryID uuid.UUID, opts SyncSearchPoolOpts) (*SyncSearchPoolResult, error) {
+	items := opts.Items
+	enqueue := opts.Enqueue
+	sourceName := opts.SourceName
+
+	if opts.ConfigVersion > 0 {
+		var cur int64
+		err := s.Pool.QueryRow(ctx, `SELECT COALESCE(synced_config_version,0) FROM categories WHERE id=$1`, categoryID).Scan(&cur)
+		if err != nil {
+			return nil, err
+		}
+		if cur >= opts.ConfigVersion {
+			return &SyncSearchPoolResult{
+				SkippedSameVersion:  true,
+				SyncedConfigVersion: cur,
+			}, nil
+		}
+	}
 	wanted := map[string]struct{}{}
 	normItems := make([]struct{ Reg, Site string }, 0, len(items))
 	for _, it := range items {
@@ -174,6 +206,16 @@ func (s *Store) SyncSearchPool(ctx context.Context, categoryID uuid.UUID, items 
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
+	}
+
+	if opts.ConfigVersion > 0 {
+		if err := s.SetSyncedConfigVersion(ctx, categoryID, opts.ConfigVersion); err != nil {
+			return out, err
+		}
+		out.SyncedConfigVersion = opts.ConfigVersion
+	} else {
+		_ = s.Pool.QueryRow(ctx, `SELECT COALESCE(synced_config_version,0) FROM categories WHERE id=$1`, categoryID).
+			Scan(&out.SyncedConfigVersion)
 	}
 
 	if enqueue && len(normItems) > 0 {

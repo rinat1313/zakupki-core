@@ -48,7 +48,8 @@ func (s *Store) ListTendersFiltered(ctx context.Context, f ListTendersFilter) ([
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_error<>''),0),
 		       COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=t.reg_number ORDER BY i.updated_at DESC LIMIT 1),''),
 		       a.score,
-		       COALESCE(a.details->>'recommendation', '')
+		       COALESCE(a.details->>'recommendation', ''),
+		       COALESCE(a.summary, '')
 		FROM tenders t
 		LEFT JOIN tender_categories tc ON tc.tender_id=t.id
 		LEFT JOIN categories c ON c.id=tc.category_id
@@ -58,7 +59,7 @@ func (s *Store) ListTendersFiltered(ctx context.Context, f ListTendersFilter) ([
 		  AND ($3='' OR t.reg_number ILIKE '%'||$3||'%' OR t.object_name ILIKE '%'||$3||'%')
 		  AND ($4='' OR t.analysis_status::text=$4)
 		  AND (NOT $5 OR t.retained)
-		GROUP BY t.id, a.score, a.details
+		GROUP BY t.id, a.score, a.details, a.summary
 		ORDER BY t.application_end NULLS LAST, t.updated_at DESC
 		LIMIT $6`,
 		strings.TrimSpace(f.CategorySlug),
@@ -83,7 +84,7 @@ func (s *Store) ListTendersFiltered(ctx context.Context, f ListTendersFilter) ([
 			&t.StoredCollectPct, &t.StoredAIPct,
 			&t.CategorySlugs, &t.InSearchPool,
 			&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &rec); err != nil {
+			&t.IngestStatus, &t.AssessScore, &rec, &t.AssessSummary); err != nil {
 			return nil, err
 		}
 		t.Recommendation = rec
@@ -186,7 +187,12 @@ func maxInt(a, b int) int {
 }
 
 // NextTenderReadyForAI — ingest завершён (ok), есть текст; не ждём process_status всех документов.
+// Если globalAutoAI=false, берёт только тендеры категорий с categories.auto_ai=true.
 func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
+	return s.NextTenderReadyForAIScoped(ctx, true)
+}
+
+func (s *Store) NextTenderReadyForAIScoped(ctx context.Context, globalAutoAI bool) (*Tender, error) {
 	var id uuid.UUID
 	err := s.Pool.QueryRow(ctx, `
 		SELECT t.id FROM tenders t
@@ -203,8 +209,16 @@ func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
 		    WHERE d.tender_id=t.id AND NOT d.removed
 		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
 		  )
+		  AND (
+		    $1::bool
+		    OR EXISTS (
+		      SELECT 1 FROM tender_categories tc
+		      JOIN categories c ON c.id=tc.category_id
+		      WHERE tc.tender_id=t.id AND c.auto_ai
+		    )
+		  )
 		ORDER BY t.updated_at ASC
-		LIMIT 1`).Scan(&id)
+		LIMIT 1`, globalAutoAI).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -248,13 +262,14 @@ func (s *Store) EnrichTenderUI(ctx context.Context, t *Tender) error {
 		  COALESCE((SELECT i.status::text FROM ingest_job_items i WHERE i.reg_number=$2 ORDER BY i.updated_at DESC LIMIT 1),''),
 		  a.score,
 		  COALESCE(a.details->>'recommendation', ''),
+		  COALESCE(a.summary, ''),
 		  COALESCE(t.collect_pct,0),
 		  COALESCE(t.ai_pct,0)
 		FROM tenders t
 		LEFT JOIN tender_assessments a ON a.tender_id=t.id
 		WHERE t.id=$1`, t.ID, t.RegNumber).
 		Scan(&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
-			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.StoredCollectPct, &t.StoredAIPct)
+			&t.IngestStatus, &t.AssessScore, &t.Recommendation, &t.AssessSummary, &t.StoredCollectPct, &t.StoredAIPct)
 	if err != nil {
 		return err
 	}

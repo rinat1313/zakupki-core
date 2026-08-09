@@ -41,9 +41,6 @@ func (c *Controller) AutoAIEnabled() bool { return c.autoAI.Load() }
 
 func (c *Controller) SetAutoAI(on bool) {
 	c.autoAI.Store(on)
-	if !on {
-		c.StopAnalyze()
-	}
 }
 
 func (c *Controller) PauseIngest() {

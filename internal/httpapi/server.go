@@ -39,12 +39,16 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /api/v1/categories", s.listCategories)
 	s.Mux.HandleFunc("POST /api/v1/categories", s.createCategory)
 	s.Mux.HandleFunc("GET /api/v1/categories/by-search-config/{id}", s.getCategoryBySearchConfig)
+	s.Mux.HandleFunc("GET /api/v1/categories/by-search-profile/{id}", s.getCategoryBySearchConfig)
 	s.Mux.HandleFunc("GET /api/v1/categories/{slug}", s.getCategory)
 	s.Mux.HandleFunc("PATCH /api/v1/categories/{slug}", s.patchCategory)
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}", s.deleteCategory)
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/tenders", s.clearCategoryTenders)
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/jobs", s.clearCategoryJobs)
 	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/refresh", s.refreshCategory)
+	s.Mux.HandleFunc("PUT /api/v1/categories/{slug}/auto-ai", s.setCategoryAutoAI)
+	s.Mux.HandleFunc("PUT /api/v1/categories/by-search-config/{id}/auto-ai", s.setSearchConfigAutoAI)
+	s.Mux.HandleFunc("PUT /api/v1/categories/by-search-profile/{id}/auto-ai", s.setSearchConfigAutoAI)
 	s.Mux.HandleFunc("GET /api/v1/categories/{slug}/ai-configs", s.listAIConfigs)
 	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/ai-configs", s.createAIConfig)
 	s.Mux.HandleFunc("PUT /api/v1/categories/{slug}/ai-configs/{id}", s.updateAIConfig)
@@ -68,6 +72,8 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/refresh", s.refreshTender)
 	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/sync", s.syncCategoryPool)
 	s.Mux.HandleFunc("POST /api/v1/categories/by-search-config/{id}/sync", s.syncSearchConfigPool)
+	s.Mux.HandleFunc("POST /api/v1/categories/by-search-profile/{id}/sync", s.syncSearchConfigPool)
+	s.Mux.HandleFunc("POST /api/v1/search-profiles/{id}/sync", s.syncSearchConfigPool)
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/documents", s.listDocuments)
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/events", s.listEvents)
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/assessment", s.getAssessment)
@@ -118,18 +124,31 @@ func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createCategory(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title          string `json:"title"`
-		Slug           string `json:"slug"`
-		SearchConfigID string `json:"search_config_id"`
+		Title           string `json:"title"`
+		Slug            string `json:"slug"`
+		SearchConfigID  string `json:"search_config_id"`
+		SearchProfileID string `json:"search_profile_id"`
+		AutoAI          *bool  `json:"auto_ai"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, err)
 		return
 	}
-	c, err := s.Store.CreateCategoryWithSearchConfig(r.Context(), body.Title, body.Slug, body.SearchConfigID)
+	sid := strings.TrimSpace(body.SearchConfigID)
+	if sid == "" {
+		sid = strings.TrimSpace(body.SearchProfileID)
+	}
+	c, err := s.Store.CreateCategoryWithSearchConfig(r.Context(), body.Title, body.Slug, sid)
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	if body.AutoAI != nil {
+		c, err = s.Store.SetCategoryAutoAI(r.Context(), c.ID, *body.AutoAI)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, c)
 }
@@ -154,20 +173,88 @@ func (s *Server) getCategoryBySearchConfig(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) patchCategory(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title          *string `json:"title"`
-		Slug           *string `json:"slug"`
-		SearchConfigID *string `json:"search_config_id"`
+		Title           *string `json:"title"`
+		Slug            *string `json:"slug"`
+		SearchConfigID  *string `json:"search_config_id"`
+		SearchProfileID *string `json:"search_profile_id"`
+		AutoAI          *bool   `json:"auto_ai"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, err)
 		return
 	}
-	c, err := s.Store.UpdateCategory(r.Context(), r.PathValue("slug"), body.Title, body.Slug, body.SearchConfigID)
+	sid := body.SearchConfigID
+	if sid == nil {
+		sid = body.SearchProfileID
+	}
+	c, err := s.Store.UpdateCategory(r.Context(), r.PathValue("slug"), body.Title, body.Slug, sid)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	if body.AutoAI != nil {
+		c, err = s.Store.SetCategoryAutoAI(r.Context(), c.ID, *body.AutoAI)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) setCategoryAutoAI(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.writeCategoryAutoAI(w, r, cat)
+}
+
+func (s *Server) setSearchConfigAutoAI(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySearchConfigID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.writeCategoryAutoAI(w, r, cat)
+}
+
+func (s *Server) writeCategoryAutoAI(w http.ResponseWriter, r *http.Request, cat *store.Category) {
+	var body struct {
+		Enabled *bool `json:"enabled"`
+		AutoAI  *bool `json:"auto_ai"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	on := false
+	switch {
+	case body.Enabled != nil:
+		on = *body.Enabled
+	case body.AutoAI != nil:
+		on = *body.AutoAI
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "нужно поле enabled или auto_ai"})
+		return
+	}
+	if on && (s.Analizator == nil || !s.Analizator.Enabled()) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "AI-анализатор не настроен (ANALIZATOR_URL)",
+		})
+		return
+	}
+	// Включаем ingest — сбор документов нужен до AI.
+	if on {
+		s.Control.ResumeIngest()
+	}
+	out, err := s.Store.SetCategoryAutoAI(r.Context(), cat.ID, on)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) deleteCategory(w http.ResponseWriter, r *http.Request) {
@@ -219,21 +306,27 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 // Привязка списка: search_config_id и/или category_slug / category_title.
 func (s *Server) ingestItems(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SearchConfigID string `json:"search_config_id"`
-		CategorySlug   string `json:"category_slug"`
-		CategoryTitle  string `json:"category_title"`
-		SourceName     string `json:"source_name"`
-		Items          []struct {
+		SearchConfigID  string `json:"search_config_id"`
+		SearchProfileID string `json:"search_profile_id"`
+		CategorySlug    string `json:"category_slug"`
+		CategoryTitle   string `json:"category_title"`
+		SourceName      string `json:"source_name"`
+		Items           []struct {
 			RegNumber  string `json:"reg_number"`
 			SourceSite string `json:"source_site"`
+			NoticeURL  string `json:"notice_url"`
 		} `json:"items"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, err)
 		return
 	}
-	if strings.TrimSpace(body.SearchConfigID) == "" && strings.TrimSpace(body.CategorySlug) == "" && strings.TrimSpace(body.CategoryTitle) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "search_config_id, category_slug or category_title required"})
+	sid := strings.TrimSpace(body.SearchConfigID)
+	if sid == "" {
+		sid = strings.TrimSpace(body.SearchProfileID)
+	}
+	if sid == "" && strings.TrimSpace(body.CategorySlug) == "" && strings.TrimSpace(body.CategoryTitle) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "search_config_id/search_profile_id, category_slug or category_title required"})
 		return
 	}
 	if len(body.Items) == 0 {
@@ -244,6 +337,9 @@ func (s *Server) ingestItems(w http.ResponseWriter, r *http.Request) {
 	for _, it := range body.Items {
 		reg := strings.TrimSpace(it.RegNumber)
 		site := strings.TrimSpace(it.SourceSite)
+		if site == "" {
+			site = strings.TrimSpace(it.NoticeURL)
+		}
 		if reg == "" && site == "" {
 			continue
 		}
@@ -258,7 +354,7 @@ func (s *Server) ingestItems(w http.ResponseWriter, r *http.Request) {
 		src = "searcher"
 	}
 	s.Control.ResumeIngest()
-	job, err := ingest.StartIngestBound(r.Context(), s.Store, body.CategorySlug, body.CategoryTitle, body.SearchConfigID, src, items)
+	job, err := ingest.StartIngestBound(r.Context(), s.Store, body.CategorySlug, body.CategoryTitle, sid, src, items)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -410,9 +506,13 @@ func (s *Server) ingestStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listTenders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	retained := q.Get("retained") == "1" || q.Get("retained") == "true" || q.Get("workspace") == "1"
+	searchID := q.Get("search_config_id")
+	if searchID == "" {
+		searchID = q.Get("search_profile_id")
+	}
 	list, err := s.Store.ListTendersFiltered(r.Context(), store.ListTendersFilter{
 		CategorySlug:   q.Get("category"),
-		SearchConfigID: q.Get("search_config_id"),
+		SearchConfigID: searchID,
 		Q:              q.Get("q"),
 		Status:         q.Get("status"),
 		RetainedOnly:   retained,
@@ -522,7 +622,16 @@ func (s *Server) syncCategoryPool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) syncSearchConfigPool(w http.ResponseWriter, r *http.Request) {
-	cat, err := s.Store.GetCategoryBySearchConfigID(r.Context(), r.PathValue("id"))
+	id := strings.TrimSpace(r.PathValue("id"))
+	cat, err := s.Store.GetCategoryBySearchConfigID(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		// Первый sync от zakupki-search — создаём список под profile id.
+		title := "search-" + id
+		if len(title) > 64 {
+			title = title[:64]
+		}
+		cat, err = s.Store.CreateCategoryWithSearchConfig(r.Context(), title, "", id)
+	}
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -532,9 +641,14 @@ func (s *Server) syncSearchConfigPool(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Category) {
 	var body struct {
-		Items []struct {
+		SearchProfileID string `json:"search_profile_id"`
+		SearchConfigID  string `json:"search_config_id"`
+		ConfigVersion   int64  `json:"config_version"`
+		Items           []struct {
 			RegNumber  string `json:"reg_number"`
 			SourceSite string `json:"source_site"`
+			NoticeURL  string `json:"notice_url"`
+			Law        string `json:"law"`
 		} `json:"items"`
 		Enqueue    *bool  `json:"enqueue"`
 		SourceName string `json:"source_name"`
@@ -543,19 +657,42 @@ func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Cat
 		writeErr(w, err)
 		return
 	}
+	// Если в теле другой profile id — перепроверим / привяжем.
+	wantID := strings.TrimSpace(body.SearchProfileID)
+	if wantID == "" {
+		wantID = strings.TrimSpace(body.SearchConfigID)
+	}
+	if wantID != "" && (cat.SearchConfigID == nil || *cat.SearchConfigID != wantID) {
+		updated, err := s.Store.UpdateCategory(r.Context(), cat.Slug, nil, nil, &wantID)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		cat = updated
+	}
 	items := make([]struct{ Reg, Site string }, 0, len(body.Items))
 	for _, it := range body.Items {
-		items = append(items, struct{ Reg, Site string }{Reg: it.RegNumber, Site: it.SourceSite})
+		site := strings.TrimSpace(it.SourceSite)
+		if site == "" && strings.TrimSpace(it.NoticeURL) != "" {
+			site = strings.TrimSpace(it.NoticeURL)
+		}
+		items = append(items, struct{ Reg, Site string }{Reg: it.RegNumber, Site: site})
 	}
 	enqueue := true
 	if body.Enqueue != nil {
 		enqueue = *body.Enqueue
 	}
 	s.Control.ResumeIngest()
-	res, err := s.Store.SyncSearchPool(r.Context(), cat.ID, items, enqueue, body.SourceName)
+	res, err := s.Store.SyncSearchPoolOpts(r.Context(), cat.ID, store.SyncSearchPoolOpts{
+		Items: items, Enqueue: enqueue, SourceName: body.SourceName, ConfigVersion: body.ConfigVersion,
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	fresh, _ := s.Store.GetCategoryBySlug(r.Context(), cat.Slug)
+	if fresh != nil {
+		cat = fresh
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"category": cat,
@@ -679,6 +816,11 @@ func (s *Server) analyzeTender(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
+	out := s.enrichedWorkersStatus(r.Context())
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) enrichedWorkersStatus(ctx context.Context) map[string]any {
 	out := s.Control.Status()
 	azOK := s.Analizator != nil && s.Analizator.Enabled()
 	out["analizator_configured"] = azOK
@@ -687,7 +829,15 @@ func (s *Server) workersStatus(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out["analizator"] = "disabled"
 	}
-	writeJSON(w, http.StatusOK, out)
+	catOn, _ := s.Store.AnyCategoryAutoAI(ctx)
+	out["category_auto_ai"] = catOn
+	// Для UI: AI «включён», если глобально или хотя бы у одного поисковика.
+	if catOn {
+		out["auto_ai_effective"] = true
+	} else {
+		out["auto_ai_effective"] = out["auto_ai"]
+	}
+	return out
 }
 
 func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
@@ -716,9 +866,15 @@ func (s *Server) setAutoAI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Control.SetAutoAI(on)
-	out := s.Control.Status()
-	out["analizator_configured"] = s.Analizator != nil && s.Analizator.Enabled()
-	writeJSON(w, http.StatusOK, out)
+	if on {
+		s.Control.ResumeIngest()
+	} else {
+		// Не гасим текущие AI, если у поисковиков ещё включён свой auto_ai.
+		if catOn, _ := s.Store.AnyCategoryAutoAI(r.Context()); !catOn {
+			s.Control.StopAnalyze()
+		}
+	}
+	writeJSON(w, http.StatusOK, s.enrichedWorkersStatus(r.Context()))
 }
 
 func (s *Server) ingestPause(w http.ResponseWriter, r *http.Request) {

@@ -19,11 +19,16 @@ type Category struct {
 	ID               uuid.UUID  `json:"id"`
 	Slug             string     `json:"slug"`
 	Title            string     `json:"title"`
-	// SearchConfigID — уникальный id конфигурации поисковика (внешний сервис настройки поиска).
-	// Список тендеров категории привязан к этой конфигурации.
-	SearchConfigID   *string    `json:"search_config_id,omitempty"`
-	ActiveAIConfigID *uuid.UUID `json:"active_ai_config_id,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
+	// SearchConfigID — id настройки поиска (zakupki-search profile id).
+	SearchConfigID *string `json:"search_config_id,omitempty"`
+	// SearchProfileID — алиас search_config_id для контракта zakupki-search / UI.
+	SearchProfileID *string `json:"search_profile_id,omitempty"`
+	// AutoAI — включить автосбор AI-анализа для тендеров этого поисковика.
+	AutoAI               bool       `json:"auto_ai"`
+	SyncedConfigVersion  int64      `json:"synced_config_version"`
+	ActiveAIConfigID     *uuid.UUID `json:"active_ai_config_id,omitempty"`
+	TendersCount         int        `json:"tenders_count,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
 }
 
 type Customer struct {
@@ -81,6 +86,7 @@ type Tender struct {
 	IngestStatus     string   `json:"ingest_status,omitempty"`
 	Recommendation   string   `json:"recommendation,omitempty"`
 	AssessScore      *float64 `json:"assess_score,omitempty"`
+	AssessSummary    string   `json:"assess_summary,omitempty"`
 	ReadyForAI       bool     `json:"ready_for_ai"`
 	CardTone         string   `json:"card_tone,omitempty"` // good|bad|pending|neutral
 	InSearchPool     bool     `json:"in_search_pool"` // есть связь с категорией поисковика
@@ -165,22 +171,35 @@ func slugify(title string) string {
 	return out
 }
 
+func decorateCategory(c *Category) {
+	if c == nil {
+		return
+	}
+	c.SearchProfileID = c.SearchConfigID
+}
+
 func scanCategory(row pgx.Row) (*Category, error) {
 	var c Category
-	err := row.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.AutoAI, &c.SyncedConfigVersion, &c.ActiveAIConfigID, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	decorateCategory(&c)
 	return &c, nil
 }
 
-const categoryCols = `id, slug, title, search_config_id, active_ai_config_id, created_at`
+const categoryCols = `id, slug, title, search_config_id, COALESCE(auto_ai,false), COALESCE(synced_config_version,0), active_ai_config_id, created_at`
 
 func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT `+categoryCols+` FROM categories ORDER BY title`)
+	rows, err := s.Pool.Query(ctx, `
+		SELECT c.id, c.slug, c.title, c.search_config_id, COALESCE(c.auto_ai,false), COALESCE(c.synced_config_version,0),
+		       c.active_ai_config_id, c.created_at,
+		       COALESCE((SELECT count(*) FROM tender_categories tc WHERE tc.category_id=c.id),0)
+		FROM categories c
+		ORDER BY c.title`)
 	if err != nil {
 		return nil, err
 	}
@@ -188,9 +207,11 @@ func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
 	var out []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.AutoAI, &c.SyncedConfigVersion,
+			&c.ActiveAIConfigID, &c.CreatedAt, &c.TendersCount); err != nil {
 			return nil, err
 		}
+		decorateCategory(&c)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -226,18 +247,12 @@ func (s *Store) CreateCategoryWithSearchConfig(ctx context.Context, title, slug,
 	if searchConfigID != "" {
 		searchPtr = searchConfigID
 	}
-	var c Category
-	err := s.Pool.QueryRow(ctx,
+	return scanCategory(s.Pool.QueryRow(ctx,
 		`INSERT INTO categories(slug, title, search_config_id) VALUES($1,$2,$3)
 		 ON CONFLICT (slug) DO UPDATE SET
 		   title=EXCLUDED.title,
 		   search_config_id=COALESCE(EXCLUDED.search_config_id, categories.search_config_id)
-		 RETURNING `+categoryCols, slug, title, searchPtr).
-		Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &c, nil
+		 RETURNING `+categoryCols, slug, title, searchPtr))
 }
 
 // UpdateCategory patches title/slug/search_config_id. Nil pointers mean "leave unchanged".
@@ -274,16 +289,32 @@ func (s *Store) UpdateCategory(ctx context.Context, slug string, title, newSlug,
 	} else if cur.SearchConfigID != nil {
 		searchPtr = *cur.SearchConfigID
 	}
-	var c Category
-	err = s.Pool.QueryRow(ctx, `
+	return scanCategory(s.Pool.QueryRow(ctx, `
 		UPDATE categories SET slug=$2, title=$3, search_config_id=$4
 		WHERE id=$1
-		RETURNING `+categoryCols, cur.ID, cur.Slug, cur.Title, searchPtr).
-		Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt)
+		RETURNING `+categoryCols, cur.ID, cur.Slug, cur.Title, searchPtr))
+}
+
+func (s *Store) SetCategoryAutoAI(ctx context.Context, categoryID uuid.UUID, enabled bool) (*Category, error) {
+	tag, err := s.Pool.Exec(ctx, `UPDATE categories SET auto_ai=$2 WHERE id=$1`, categoryID, enabled)
 	if err != nil {
 		return nil, err
 	}
-	return &c, nil
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return scanCategory(s.Pool.QueryRow(ctx, `SELECT `+categoryCols+` FROM categories WHERE id=$1`, categoryID))
+}
+
+func (s *Store) AnyCategoryAutoAI(ctx context.Context) (bool, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM categories WHERE auto_ai`).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) SetSyncedConfigVersion(ctx context.Context, categoryID uuid.UUID, version int64) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE categories SET synced_config_version=$2 WHERE id=$1`, categoryID, version)
+	return err
 }
 
 func (s *Store) DeleteCategory(ctx context.Context, slug string) error {

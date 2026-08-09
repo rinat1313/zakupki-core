@@ -23,9 +23,11 @@
 | Тендеры списка | `GET /api/v1/tenders?search_config_id=...` или `?category=slug` |
 | Загрузить CSV в список | `POST /api/v1/ingest` (`search_config_id` / `category_slug`) |
 | Пуш результатов поисковика | `POST /api/v1/ingest/items` (JSON + `search_config_id`) |
-| Sync пула при смене поиска | `POST /api/v1/categories/by-search-config/{id}/sync` |
+| Sync пула (контракт search) | `POST /api/v1/search-profiles/{id}/sync` (`search_profile_id`, `config_version`, `items`) |
+| Auto-AI для поисковика | `PUT /api/v1/categories/by-search-profile/{id}/auto-ai` `{enabled:true}` |
 | Сохранить тендер вне пула | `POST /api/v1/tenders/{id}/retain` (`interesting` / `in_work` / `manual`) |
 | Workspace (сохранённые) | `GET /api/v1/tenders?retained=true` |
+| Тендеры поисковика | `GET /api/v1/tenders?search_profile_id=...` (алиас `search_config_id`) |
 
 ### Retention (чтобы не потерять закупки при смене поиска)
 
@@ -38,10 +40,18 @@
 
 Ручной retain: интересная / взяли в работу.
 
+**Сбор + AI по выбранному поисковику (UI «Поисковики»):**
+1. Search/gateway шлёт sync snapshot → core создаёт/обновляет список (`search_profile_id`)
+2. Ingest воркеры собирают карточки/документы (`enqueue: true`)
+3. `PUT .../auto-ai {enabled:true}` на категории поисковика → auto-AI берёт только его готовые тендеры
+4. UI читает `GET /tenders?search_profile_id=...` (`collect_pct`, `ai_pct`, `assess_summary`, `card_tone`)
+
 ```json
-POST /api/v1/categories/by-search-config/{search_config_id}/sync
+POST /api/v1/search-profiles/{search_profile_id}/sync
 {
-  "items": [{"reg_number":"…","source_site":"https://zakupki.gov.ru"}],
+  "search_profile_id": "…",
+  "config_version": 3,
+  "items": [{"reg_number":"…","notice_url":"https://zakupki.gov.ru/…"}],
   "enqueue": true
 }
 ```

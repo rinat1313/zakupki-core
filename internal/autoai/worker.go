@@ -44,10 +44,16 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 func (w *Worker) tick(ctx context.Context) {
-	if w.Control == nil || !w.Control.AutoAIEnabled() {
+	if w.Control == nil || w.Store == nil {
 		return
 	}
 	if w.Analizator == nil || !w.Analizator.Enabled() {
+		return
+	}
+	globalOn := w.Control.AutoAIEnabled()
+	catOn, _ := w.Store.AnyCategoryAutoAI(ctx)
+	// Глобальный Auto (каталог) или Auto AI у конкретного поисковика/категории.
+	if !globalOn && !catOn {
 		return
 	}
 	free := w.Control.FreeAnalyzeSlots()
@@ -59,7 +65,7 @@ func (w *Worker) tick(ctx context.Context) {
 		if !ok {
 			return
 		}
-		tender, err := w.Store.NextTenderReadyForAI(ctx)
+		tender, err := w.Store.NextTenderReadyForAIScoped(ctx, globalOn)
 		if err != nil {
 			release()
 			if !errors.Is(err, store.ErrNotFound) {
