@@ -19,6 +19,9 @@ type Category struct {
 	ID               uuid.UUID  `json:"id"`
 	Slug             string     `json:"slug"`
 	Title            string     `json:"title"`
+	// SearchConfigID — уникальный id конфигурации поисковика (внешний сервис настройки поиска).
+	// Список тендеров категории привязан к этой конфигурации.
+	SearchConfigID   *string    `json:"search_config_id,omitempty"`
 	ActiveAIConfigID *uuid.UUID `json:"active_ai_config_id,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 }
@@ -156,27 +159,9 @@ func slugify(title string) string {
 	return out
 }
 
-func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id, slug, title, active_ai_config_id, created_at FROM categories ORDER BY title`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Category
-	for rows.Next() {
-		var c Category
-		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.ActiveAIConfigID, &c.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) GetCategoryBySlug(ctx context.Context, slug string) (*Category, error) {
+func scanCategory(row pgx.Row) (*Category, error) {
 	var c Category
-	err := s.Pool.QueryRow(ctx, `SELECT id, slug, title, active_ai_config_id, created_at FROM categories WHERE slug=$1`, slug).
-		Scan(&c.ID, &c.Slug, &c.Title, &c.ActiveAIConfigID, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -186,7 +171,43 @@ func (s *Store) GetCategoryBySlug(ctx context.Context, slug string) (*Category, 
 	return &c, nil
 }
 
+const categoryCols = `id, slug, title, search_config_id, active_ai_config_id, created_at`
+
+func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT `+categoryCols+` FROM categories ORDER BY title`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Category
+	for rows.Next() {
+		var c Category
+		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetCategoryBySlug(ctx context.Context, slug string) (*Category, error) {
+	return scanCategory(s.Pool.QueryRow(ctx, `SELECT `+categoryCols+` FROM categories WHERE slug=$1`, slug))
+}
+
+func (s *Store) GetCategoryBySearchConfigID(ctx context.Context, searchConfigID string) (*Category, error) {
+	searchConfigID = strings.TrimSpace(searchConfigID)
+	if searchConfigID == "" {
+		return nil, ErrNotFound
+	}
+	return scanCategory(s.Pool.QueryRow(ctx,
+		`SELECT `+categoryCols+` FROM categories WHERE search_config_id=$1`, searchConfigID))
+}
+
 func (s *Store) CreateCategory(ctx context.Context, title, slug string) (*Category, error) {
+	return s.CreateCategoryWithSearchConfig(ctx, title, slug, "")
+}
+
+func (s *Store) CreateCategoryWithSearchConfig(ctx context.Context, title, slug, searchConfigID string) (*Category, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return nil, fmt.Errorf("title required")
@@ -194,16 +215,80 @@ func (s *Store) CreateCategory(ctx context.Context, title, slug string) (*Catego
 	if slug == "" {
 		slug = slugify(title)
 	}
+	searchConfigID = strings.TrimSpace(searchConfigID)
+	var searchPtr any
+	if searchConfigID != "" {
+		searchPtr = searchConfigID
+	}
 	var c Category
 	err := s.Pool.QueryRow(ctx,
-		`INSERT INTO categories(slug, title) VALUES($1,$2)
-		 ON CONFLICT (slug) DO UPDATE SET title=EXCLUDED.title
-		 RETURNING id, slug, title, active_ai_config_id, created_at`, slug, title).
-		Scan(&c.ID, &c.Slug, &c.Title, &c.ActiveAIConfigID, &c.CreatedAt)
+		`INSERT INTO categories(slug, title, search_config_id) VALUES($1,$2,$3)
+		 ON CONFLICT (slug) DO UPDATE SET
+		   title=EXCLUDED.title,
+		   search_config_id=COALESCE(EXCLUDED.search_config_id, categories.search_config_id)
+		 RETURNING `+categoryCols, slug, title, searchPtr).
+		Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// UpdateCategory patches title/slug/search_config_id. Nil pointers mean "leave unchanged".
+// Empty searchConfigID string clears the binding.
+func (s *Store) UpdateCategory(ctx context.Context, slug string, title, newSlug, searchConfigID *string) (*Category, error) {
+	cur, err := s.GetCategoryBySlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if title != nil {
+		t := strings.TrimSpace(*title)
+		if t == "" {
+			return nil, fmt.Errorf("title required")
+		}
+		cur.Title = t
+	}
+	if newSlug != nil {
+		ns := strings.TrimSpace(*newSlug)
+		if ns == "" {
+			return nil, fmt.Errorf("slug required")
+		}
+		cur.Slug = ns
+	}
+	var searchPtr any
+	if searchConfigID != nil {
+		v := strings.TrimSpace(*searchConfigID)
+		if v == "" {
+			cur.SearchConfigID = nil
+			searchPtr = nil
+		} else {
+			cur.SearchConfigID = &v
+			searchPtr = v
+		}
+	} else if cur.SearchConfigID != nil {
+		searchPtr = *cur.SearchConfigID
+	}
+	var c Category
+	err = s.Pool.QueryRow(ctx, `
+		UPDATE categories SET slug=$2, title=$3, search_config_id=$4
+		WHERE id=$1
+		RETURNING `+categoryCols, cur.ID, cur.Slug, cur.Title, searchPtr).
+		Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.ActiveAIConfigID, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *Store) DeleteCategory(ctx context.Context, slug string) error {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM categories WHERE slug=$1`, slug)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) UpsertCustomer(ctx context.Context, c Customer) (*Customer, error) {

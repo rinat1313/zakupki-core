@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -350,18 +351,47 @@ func looksHeader(s string) bool {
 }
 
 func StartIngest(ctx context.Context, st *store.Store, categorySlug, categoryTitle, sourceName string, items []struct{ Reg, Site string }) (*store.IngestJob, error) {
-	var cat *store.Category
-	var err error
-	if categorySlug != "" {
-		cat, err = st.GetCategoryBySlug(ctx, categorySlug)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		cat, err = st.CreateCategory(ctx, categoryTitle, "")
-		if err != nil {
-			return nil, err
-		}
+	return StartIngestBound(ctx, st, categorySlug, categoryTitle, "", sourceName, items)
+}
+
+// StartIngestBound создаёт ingest job, привязанный к категории/списку.
+// Приоритет поиска списка: searchConfigID → categorySlug → создание по categoryTitle (+ searchConfigID).
+func StartIngestBound(ctx context.Context, st *store.Store, categorySlug, categoryTitle, searchConfigID, sourceName string, items []struct{ Reg, Site string }) (*store.IngestJob, error) {
+	cat, err := resolveIngestCategory(ctx, st, categorySlug, categoryTitle, searchConfigID)
+	if err != nil {
+		return nil, err
 	}
 	return st.CreateIngestJob(ctx, cat.ID, sourceName, items)
+}
+
+func resolveIngestCategory(ctx context.Context, st *store.Store, categorySlug, categoryTitle, searchConfigID string) (*store.Category, error) {
+	searchConfigID = strings.TrimSpace(searchConfigID)
+	categorySlug = strings.TrimSpace(categorySlug)
+	categoryTitle = strings.TrimSpace(categoryTitle)
+
+	if searchConfigID != "" {
+		cat, err := st.GetCategoryBySearchConfigID(ctx, searchConfigID)
+		if err == nil {
+			return cat, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		// Список для этой конфигурации ещё нет — создаём.
+		title := categoryTitle
+		if title == "" {
+			title = "search-" + searchConfigID
+			if len(title) > 64 {
+				title = title[:64]
+			}
+		}
+		return st.CreateCategoryWithSearchConfig(ctx, title, categorySlug, searchConfigID)
+	}
+	if categorySlug != "" {
+		return st.GetCategoryBySlug(ctx, categorySlug)
+	}
+	if categoryTitle != "" {
+		return st.CreateCategoryWithSearchConfig(ctx, categoryTitle, "", "")
+	}
+	return nil, fmt.Errorf("category_slug, category_title or search_config_id required")
 }

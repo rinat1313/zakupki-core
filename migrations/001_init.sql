@@ -14,11 +14,16 @@ CREATE TYPE ingest_item_status AS ENUM (
 );
 
 CREATE TABLE categories (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  slug        TEXT NOT NULL UNIQUE,
-  title       TEXT NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  slug             TEXT NOT NULL UNIQUE,
+  title            TEXT NOT NULL,
+  search_config_id TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX categories_search_config_id_uidx
+  ON categories (search_config_id)
+  WHERE search_config_id IS NOT NULL AND search_config_id <> '';
 
 CREATE TABLE customers (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),

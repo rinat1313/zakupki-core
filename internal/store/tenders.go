@@ -13,6 +13,11 @@ import (
 )
 
 func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string, limit int) ([]Tender, error) {
+	return s.ListTendersFiltered(ctx, categorySlug, "", q, status, limit)
+}
+
+// ListTendersFiltered lists tenders by category slug and/or search_config_id.
+func (s *Store) ListTendersFiltered(ctx context.Context, categorySlug, searchConfigID, q, status string, limit int) ([]Tender, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
@@ -34,11 +39,18 @@ func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string,
 		LEFT JOIN categories c ON c.id=tc.category_id
 		LEFT JOIN tender_assessments a ON a.tender_id=t.id
 		WHERE ($1='' OR c.slug=$1)
-		  AND ($2='' OR t.reg_number ILIKE '%'||$2||'%' OR t.object_name ILIKE '%'||$2||'%')
-		  AND ($3='' OR t.analysis_status::text=$3)
+		  AND ($2='' OR c.search_config_id=$2)
+		  AND ($3='' OR t.reg_number ILIKE '%'||$3||'%' OR t.object_name ILIKE '%'||$3||'%')
+		  AND ($4='' OR t.analysis_status::text=$4)
 		GROUP BY t.id, a.score, a.details
 		ORDER BY t.application_end NULLS LAST, t.updated_at DESC
-		LIMIT $4`, categorySlug, strings.TrimSpace(q), strings.TrimSpace(status), limit)
+		LIMIT $5`,
+		strings.TrimSpace(categorySlug),
+		strings.TrimSpace(searchConfigID),
+		strings.TrimSpace(q),
+		strings.TrimSpace(status),
+		limit,
+	)
 	if err != nil {
 		return nil, err
 	}

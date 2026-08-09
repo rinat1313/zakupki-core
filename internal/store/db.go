@@ -68,6 +68,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		  UNIQUE (category_id, name)
 		)`,
 		`ALTER TABLE categories ADD COLUMN IF NOT EXISTS active_ai_config_id UUID`,
+		`ALTER TABLE categories ADD COLUMN IF NOT EXISTS search_config_id TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS categories_search_config_id_uidx
+		   ON categories (search_config_id)
+		   WHERE search_config_id IS NOT NULL AND search_config_id <> ''`,
 		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS collect_pct INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS ai_pct INT NOT NULL DEFAULT 0`,
 	}

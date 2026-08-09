@@ -38,7 +38,10 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /api/v1/health", s.health)
 	s.Mux.HandleFunc("GET /api/v1/categories", s.listCategories)
 	s.Mux.HandleFunc("POST /api/v1/categories", s.createCategory)
+	s.Mux.HandleFunc("GET /api/v1/categories/by-search-config/{id}", s.getCategoryBySearchConfig)
 	s.Mux.HandleFunc("GET /api/v1/categories/{slug}", s.getCategory)
+	s.Mux.HandleFunc("PATCH /api/v1/categories/{slug}", s.patchCategory)
+	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}", s.deleteCategory)
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/tenders", s.clearCategoryTenders)
 	s.Mux.HandleFunc("DELETE /api/v1/categories/{slug}/jobs", s.clearCategoryJobs)
 	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/refresh", s.refreshCategory)
@@ -49,6 +52,7 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("PUT /api/v1/categories/{slug}/active-ai-config", s.setActiveAIConfig)
 
 	s.Mux.HandleFunc("POST /api/v1/ingest", s.ingest)
+	s.Mux.HandleFunc("POST /api/v1/ingest/items", s.ingestItems)
 	s.Mux.HandleFunc("GET /api/v1/ingest/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/v1/ingest/jobs/{id}", s.getJob)
 	s.Mux.HandleFunc("GET /api/v1/ingest/jobs/{id}/logs", s.jobLogs)
@@ -110,14 +114,15 @@ func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createCategory(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title string `json:"title"`
-		Slug  string `json:"slug"`
+		Title          string `json:"title"`
+		Slug           string `json:"slug"`
+		SearchConfigID string `json:"search_config_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, err)
 		return
 	}
-	c, err := s.Store.CreateCategory(r.Context(), body.Title, body.Slug)
+	c, err := s.Store.CreateCategoryWithSearchConfig(r.Context(), body.Title, body.Slug, body.SearchConfigID)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -134,6 +139,41 @@ func (s *Server) getCategory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
+func (s *Server) getCategoryBySearchConfig(w http.ResponseWriter, r *http.Request) {
+	c, err := s.Store.GetCategoryBySearchConfigID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) patchCategory(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Title          *string `json:"title"`
+		Slug           *string `json:"slug"`
+		SearchConfigID *string `json:"search_config_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	c, err := s.Store.UpdateCategory(r.Context(), r.PathValue("slug"), body.Title, body.Slug, body.SearchConfigID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (s *Server) deleteCategory(w http.ResponseWriter, r *http.Request) {
+	if err := s.Store.DeleteCategory(r.Context(), r.PathValue("slug")); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, err)
@@ -141,8 +181,9 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	slug := strings.TrimSpace(r.FormValue("category_slug"))
 	title := strings.TrimSpace(r.FormValue("category_title"))
-	if slug == "" && title == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "category_slug or category_title required"})
+	searchConfigID := strings.TrimSpace(r.FormValue("search_config_id"))
+	if slug == "" && title == "" && searchConfigID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "category_slug, category_title or search_config_id required"})
 		return
 	}
 	file, hdr, err := r.FormFile("file")
@@ -162,7 +203,58 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	// New upload resumes collection if it was stopped/paused.
 	s.Control.ResumeIngest()
-	job, err := ingest.StartIngest(r.Context(), s.Store, slug, title, name, items)
+	job, err := ingest.StartIngestBound(r.Context(), s.Store, slug, title, searchConfigID, name, items)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+}
+
+// ingestItems — программная постановка в очередь (от поисковика) без CSV.
+// Привязка списка: search_config_id и/или category_slug / category_title.
+func (s *Server) ingestItems(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SearchConfigID string `json:"search_config_id"`
+		CategorySlug   string `json:"category_slug"`
+		CategoryTitle  string `json:"category_title"`
+		SourceName     string `json:"source_name"`
+		Items          []struct {
+			RegNumber  string `json:"reg_number"`
+			SourceSite string `json:"source_site"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if strings.TrimSpace(body.SearchConfigID) == "" && strings.TrimSpace(body.CategorySlug) == "" && strings.TrimSpace(body.CategoryTitle) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "search_config_id, category_slug or category_title required"})
+		return
+	}
+	if len(body.Items) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "items required"})
+		return
+	}
+	items := make([]struct{ Reg, Site string }, 0, len(body.Items))
+	for _, it := range body.Items {
+		reg := strings.TrimSpace(it.RegNumber)
+		site := strings.TrimSpace(it.SourceSite)
+		if reg == "" && site == "" {
+			continue
+		}
+		items = append(items, struct{ Reg, Site string }{Reg: reg, Site: site})
+	}
+	if len(items) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no valid items"})
+		return
+	}
+	src := strings.TrimSpace(body.SourceName)
+	if src == "" {
+		src = "searcher"
+	}
+	s.Control.ResumeIngest()
+	job, err := ingest.StartIngestBound(r.Context(), s.Store, body.CategorySlug, body.CategoryTitle, body.SearchConfigID, src, items)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -313,7 +405,8 @@ func (s *Server) ingestStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listTenders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	list, err := s.Store.ListTenders(r.Context(), q.Get("category"), q.Get("q"), q.Get("status"), 500)
+	list, err := s.Store.ListTendersFiltered(r.Context(),
+		q.Get("category"), q.Get("search_config_id"), q.Get("q"), q.Get("status"), 500)
 	if err != nil {
 		writeErr(w, err)
 		return
