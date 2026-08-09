@@ -13,19 +13,34 @@ import (
 )
 
 func (s *Store) ListTenders(ctx context.Context, categorySlug, q, status string, limit int) ([]Tender, error) {
-	return s.ListTendersFiltered(ctx, categorySlug, "", q, status, limit)
+	return s.ListTendersFiltered(ctx, ListTendersFilter{
+		CategorySlug: categorySlug, Q: q, Status: status, Limit: limit,
+	})
 }
 
-// ListTendersFiltered lists tenders by category slug and/or search_config_id.
-func (s *Store) ListTendersFiltered(ctx context.Context, categorySlug, searchConfigID, q, status string, limit int) ([]Tender, error) {
+type ListTendersFilter struct {
+	CategorySlug   string
+	SearchConfigID string
+	Q              string
+	Status         string
+	RetainedOnly   bool
+	Limit          int
+}
+
+// ListTendersFiltered lists tenders by category / search_config_id / retained workspace.
+func (s *Store) ListTendersFiltered(ctx context.Context, f ListTendersFilter) ([]Tender, error) {
+	limit := f.Limit
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
 	rows, err := s.Pool.Query(ctx, `
 		SELECT t.id,t.reg_number,t.source_site,t.law,t.customer_id,t.object_name,t.status,t.nmck,t.currency,
-		       t.published_at,t.updated_on_site,t.application_end,t.analysis_status,t.payload,t.created_at,t.updated_at,
+		       t.published_at,t.updated_on_site,t.application_end,t.analysis_status,t.payload,
+		       COALESCE(t.retained,false), t.retained_at, COALESCE(t.retain_reason,''),
+		       t.created_at,t.updated_at,
 		       COALESCE(t.collect_pct,0), COALESCE(t.ai_pct,0),
 		       COALESCE(array_agg(DISTINCT c.slug) FILTER (WHERE c.slug IS NOT NULL), '{}'),
+		       COALESCE(bool_or(c.search_config_id IS NOT NULL AND c.search_config_id<>''), false),
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed),0),
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='processed'),0),
 		       COALESCE((SELECT count(*) FROM documents d WHERE d.tender_id=t.id AND NOT d.removed AND d.process_status='unprocessed'),0),
@@ -42,13 +57,15 @@ func (s *Store) ListTendersFiltered(ctx context.Context, categorySlug, searchCon
 		  AND ($2='' OR c.search_config_id=$2)
 		  AND ($3='' OR t.reg_number ILIKE '%'||$3||'%' OR t.object_name ILIKE '%'||$3||'%')
 		  AND ($4='' OR t.analysis_status::text=$4)
+		  AND (NOT $5 OR t.retained)
 		GROUP BY t.id, a.score, a.details
 		ORDER BY t.application_end NULLS LAST, t.updated_at DESC
-		LIMIT $5`,
-		strings.TrimSpace(categorySlug),
-		strings.TrimSpace(searchConfigID),
-		strings.TrimSpace(q),
-		strings.TrimSpace(status),
+		LIMIT $6`,
+		strings.TrimSpace(f.CategorySlug),
+		strings.TrimSpace(f.SearchConfigID),
+		strings.TrimSpace(f.Q),
+		strings.TrimSpace(f.Status),
+		f.RetainedOnly,
 		limit,
 	)
 	if err != nil {
@@ -60,9 +77,11 @@ func (s *Store) ListTendersFiltered(ctx context.Context, categorySlug, searchCon
 		var t Tender
 		var rec string
 		if err := rows.Scan(&t.ID, &t.RegNumber, &t.SourceSite, &t.Law, &t.CustomerID, &t.ObjectName, &t.Status, &t.NMCK, &t.Currency,
-			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt,
+			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload,
+			&t.Retained, &t.RetainedAt, &t.RetainReason,
+			&t.CreatedAt, &t.UpdatedAt,
 			&t.StoredCollectPct, &t.StoredAIPct,
-			&t.CategorySlugs,
+			&t.CategorySlugs, &t.InSearchPool,
 			&t.DocsTotal, &t.DocsProcessed, &t.DocsUnprocessed, &t.DocsWithText, &t.DocsErrors,
 			&t.IngestStatus, &t.AssessScore, &rec); err != nil {
 			return nil, err
@@ -197,6 +216,7 @@ func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
 
 // MarkAnalyzing — атомарно забирает карточку под авто-AI (только из none).
 func (s *Store) MarkAnalyzing(ctx context.Context, id uuid.UUID) error {
+	_, _ = s.RetainTender(ctx, id, RetainReasonAnalyzing)
 	tag, err := s.Pool.Exec(ctx, `UPDATE tenders SET analysis_status='analyzing', updated_at=now() WHERE id=$1 AND analysis_status='none'`, id)
 	if err != nil {
 		return err
@@ -246,15 +266,20 @@ func (s *Store) GetTender(ctx context.Context, id uuid.UUID) (*Tender, error) {
 	var t Tender
 	err := s.Pool.QueryRow(ctx, `
 		SELECT t.id,t.reg_number,t.source_site,t.law,t.customer_id,t.object_name,t.status,t.nmck,t.currency,
-		       t.published_at,t.updated_on_site,t.application_end,t.analysis_status,t.payload,t.created_at,t.updated_at,
-		       COALESCE(array_agg(c.slug) FILTER (WHERE c.slug IS NOT NULL), '{}')
+		       t.published_at,t.updated_on_site,t.application_end,t.analysis_status,t.payload,
+		       COALESCE(t.retained,false), t.retained_at, COALESCE(t.retain_reason,''),
+		       t.created_at,t.updated_at,
+		       COALESCE(array_agg(c.slug) FILTER (WHERE c.slug IS NOT NULL), '{}'),
+		       COALESCE(bool_or(c.search_config_id IS NOT NULL AND c.search_config_id<>''), false)
 		FROM tenders t
 		LEFT JOIN tender_categories tc ON tc.tender_id=t.id
 		LEFT JOIN categories c ON c.id=tc.category_id
 		WHERE t.id=$1
 		GROUP BY t.id`, id).
 		Scan(&t.ID, &t.RegNumber, &t.SourceSite, &t.Law, &t.CustomerID, &t.ObjectName, &t.Status, &t.NMCK, &t.Currency,
-			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt, &t.CategorySlugs)
+			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload,
+			&t.Retained, &t.RetainedAt, &t.RetainReason,
+			&t.CreatedAt, &t.UpdatedAt, &t.CategorySlugs, &t.InSearchPool)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -268,10 +293,14 @@ func (s *Store) FindTenderByKey(ctx context.Context, reg, site string) (*Tender,
 	var t Tender
 	err := s.Pool.QueryRow(ctx, `
 		SELECT id,reg_number,source_site,law,customer_id,object_name,status,nmck,currency,
-		       published_at,updated_on_site,application_end,analysis_status,payload,created_at,updated_at
+		       published_at,updated_on_site,application_end,analysis_status,payload,
+		       COALESCE(retained,false), retained_at, COALESCE(retain_reason,''),
+		       created_at,updated_at
 		FROM tenders WHERE reg_number=$1 AND source_site=$2`, reg, site).
 		Scan(&t.ID, &t.RegNumber, &t.SourceSite, &t.Law, &t.CustomerID, &t.ObjectName, &t.Status, &t.NMCK, &t.Currency,
-			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt)
+			&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload,
+			&t.Retained, &t.RetainedAt, &t.RetainReason,
+			&t.CreatedAt, &t.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -330,11 +359,15 @@ func (s *Store) UpsertTender(ctx context.Context, in TenderUpsertInput) (*Tender
 		  payload=EXCLUDED.payload,
 		  updated_at=now()
 		RETURNING id,reg_number,source_site,law,customer_id,object_name,status,nmck,currency,
-		  published_at,updated_on_site,application_end,analysis_status,payload,created_at,updated_at`,
+		  published_at,updated_on_site,application_end,analysis_status,payload,
+		  COALESCE(retained,false), retained_at, COALESCE(retain_reason,''),
+		  created_at,updated_at`,
 		in.RegNumber, in.SourceSite, in.Law, in.CustomerID, in.ObjectName, in.Status, in.NMCK, in.Currency,
 		in.PublishedAt, in.UpdatedOnSite, in.ApplicationEnd, in.Payload,
 	).Scan(&t.ID, &t.RegNumber, &t.SourceSite, &t.Law, &t.CustomerID, &t.ObjectName, &t.Status, &t.NMCK, &t.Currency,
-		&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload, &t.CreatedAt, &t.UpdatedAt)
+		&t.PublishedAt, &t.UpdatedOnSite, &t.ApplicationEnd, &t.AnalysisStatus, &t.Payload,
+		&t.Retained, &t.RetainedAt, &t.RetainReason,
+		&t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return nil, false, err
 	}

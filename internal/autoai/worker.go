@@ -139,6 +139,7 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 
 	startPct := 5
 	_ = st.SetTenderProgress(ctx, t.ID, nil, &startPct)
+	_, _ = st.RetainTender(ctx, t.ID, store.RetainReasonAnalyzing)
 	_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": "analyzing"})
 
 	var analyzeCtx context.Context
@@ -237,6 +238,12 @@ func AnalyzeTender(ctx context.Context, st *store.Store, ctrl *control.Controlle
 		stStatus = "other"
 	}
 	_, _ = st.UpdateTender(ctx, t.ID, map[string]any{"analysis_status": stStatus})
+	switch strings.ToLower(strings.TrimSpace(res.Recommendation)) {
+	case "participate", "caution":
+		_, _ = st.RetainTender(ctx, t.ID, store.RetainReasonAIInteresting)
+	default:
+		// already retained when analysis started
+	}
 	return nil
 }
 

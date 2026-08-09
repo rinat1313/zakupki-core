@@ -74,6 +74,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		   WHERE search_config_id IS NOT NULL AND search_config_id <> ''`,
 		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS collect_pct INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS ai_pct INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS retained BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS retained_at TIMESTAMPTZ`,
+		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS retain_reason TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS tenders_retained_idx ON tenders (retained) WHERE retained`,
 	}
 	for _, q := range stmts {
 		if _, err := pool.Exec(ctx, q); err != nil {

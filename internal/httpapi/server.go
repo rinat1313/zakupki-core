@@ -63,7 +63,11 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}", s.getTender)
 	s.Mux.HandleFunc("PATCH /api/v1/tenders/{id}", s.patchTender)
 	s.Mux.HandleFunc("DELETE /api/v1/tenders/{id}", s.deleteTender)
+	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/retain", s.retainTender)
+	s.Mux.HandleFunc("DELETE /api/v1/tenders/{id}/retain", s.unretainTender)
 	s.Mux.HandleFunc("POST /api/v1/tenders/{id}/refresh", s.refreshTender)
+	s.Mux.HandleFunc("POST /api/v1/categories/{slug}/sync", s.syncCategoryPool)
+	s.Mux.HandleFunc("POST /api/v1/categories/by-search-config/{id}/sync", s.syncSearchConfigPool)
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/documents", s.listDocuments)
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/events", s.listEvents)
 	s.Mux.HandleFunc("GET /api/v1/tenders/{id}/assessment", s.getAssessment)
@@ -405,8 +409,15 @@ func (s *Server) ingestStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listTenders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	list, err := s.Store.ListTendersFiltered(r.Context(),
-		q.Get("category"), q.Get("search_config_id"), q.Get("q"), q.Get("status"), 500)
+	retained := q.Get("retained") == "1" || q.Get("retained") == "true" || q.Get("workspace") == "1"
+	list, err := s.Store.ListTendersFiltered(r.Context(), store.ListTendersFilter{
+		CategorySlug:   q.Get("category"),
+		SearchConfigID: q.Get("search_config_id"),
+		Q:              q.Get("q"),
+		Status:         q.Get("status"),
+		RetainedOnly:   retained,
+		Limit:          500,
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -467,6 +478,89 @@ func (s *Server) deleteTender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) retainTender(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	t, err := s.Store.RetainTender(r.Context(), id, body.Reason)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) unretainTender(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	t, err := s.Store.UnretainTender(r.Context(), id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+func (s *Server) syncCategoryPool(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.syncPool(w, r, cat)
+}
+
+func (s *Server) syncSearchConfigPool(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySearchConfigID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.syncPool(w, r, cat)
+}
+
+func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Category) {
+	var body struct {
+		Items []struct {
+			RegNumber  string `json:"reg_number"`
+			SourceSite string `json:"source_site"`
+		} `json:"items"`
+		Enqueue    *bool  `json:"enqueue"`
+		SourceName string `json:"source_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	items := make([]struct{ Reg, Site string }, 0, len(body.Items))
+	for _, it := range body.Items {
+		items = append(items, struct{ Reg, Site string }{Reg: it.RegNumber, Site: it.SourceSite})
+	}
+	enqueue := true
+	if body.Enqueue != nil {
+		enqueue = *body.Enqueue
+	}
+	s.Control.ResumeIngest()
+	res, err := s.Store.SyncSearchPool(r.Context(), cat.ID, items, enqueue, body.SourceName)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"category": cat,
+		"sync":     res,
+	})
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {

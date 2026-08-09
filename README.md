@@ -23,6 +23,28 @@
 | Тендеры списка | `GET /api/v1/tenders?search_config_id=...` или `?category=slug` |
 | Загрузить CSV в список | `POST /api/v1/ingest` (`search_config_id` / `category_slug`) |
 | Пуш результатов поисковика | `POST /api/v1/ingest/items` (JSON + `search_config_id`) |
+| Sync пула при смене поиска | `POST /api/v1/categories/by-search-config/{id}/sync` |
+| Сохранить тендер вне пула | `POST /api/v1/tenders/{id}/retain` (`interesting` / `in_work` / `manual`) |
+| Workspace (сохранённые) | `GET /api/v1/tenders?retained=true` |
+
+### Retention (чтобы не потерять закупки при смене поиска)
+
+Пул поисковика может обновляться (sync). Тендеры с `retained=true` **не удаляются** из БД:
+их только отвязывают от списка поиска. Они остаются в workspace.
+
+Авто-retain:
+- старт AI-анализа (`analyzing`)
+- AI-рекомендация `participate` / `caution`
+
+Ручной retain: интересная / взяли в работу.
+
+```json
+POST /api/v1/categories/by-search-config/{search_config_id}/sync
+{
+  "items": [{"reg_number":"…","source_site":"https://zakupki.gov.ru"}],
+  "enqueue": true
+}
+```
 
 ## Env
 

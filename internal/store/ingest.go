@@ -339,18 +339,26 @@ func (s *Store) ClearCategoryTenders(ctx context.Context, categoryID uuid.UUID) 
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT tender_id FROM tender_categories WHERE category_id=$1`, categoryID)
+	rows, err := tx.Query(ctx, `
+		SELECT t.id, COALESCE(t.retained,false)
+		FROM tender_categories tc
+		JOIN tenders t ON t.id=tc.tender_id
+		WHERE tc.category_id=$1`, categoryID)
 	if err != nil {
 		return 0, err
 	}
-	var ids []uuid.UUID
+	type row struct {
+		id       uuid.UUID
+		retained bool
+	}
+	var ids []row
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var r row
+		if err := rows.Scan(&r.id, &r.retained); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		ids = append(ids, id)
+		ids = append(ids, r)
 	}
 	rows.Close()
 	_, err = tx.Exec(ctx, `DELETE FROM tender_categories WHERE category_id=$1`, categoryID)
@@ -358,11 +366,14 @@ func (s *Store) ClearCategoryTenders(ctx context.Context, categoryID uuid.UUID) 
 		return 0, err
 	}
 	var n int64
-	for _, id := range ids {
+	for _, r := range ids {
+		if r.retained {
+			continue // workspace tenders stay in DB outside the search list
+		}
 		var left int
-		_ = tx.QueryRow(ctx, `SELECT count(*) FROM tender_categories WHERE tender_id=$1`, id).Scan(&left)
+		_ = tx.QueryRow(ctx, `SELECT count(*) FROM tender_categories WHERE tender_id=$1`, r.id).Scan(&left)
 		if left == 0 {
-			tag, err := tx.Exec(ctx, `DELETE FROM tenders WHERE id=$1`, id)
+			tag, err := tx.Exec(ctx, `DELETE FROM tenders WHERE id=$1 AND retained=false`, r.id)
 			if err != nil {
 				return 0, err
 			}

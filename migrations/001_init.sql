@@ -59,12 +59,16 @@ CREATE TABLE tenders (
   application_end  TIMESTAMPTZ,
   analysis_status  analysis_status NOT NULL DEFAULT 'none',
   payload          JSONB NOT NULL DEFAULT '{}'::jsonb,
+  retained         BOOLEAN NOT NULL DEFAULT FALSE,
+  retained_at      TIMESTAMPTZ,
+  retain_reason    TEXT NOT NULL DEFAULT '',
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (reg_number, source_site)
 );
 
 CREATE INDEX tenders_analysis_status_idx ON tenders(analysis_status);
+CREATE INDEX tenders_retained_idx ON tenders (retained) WHERE retained;
 CREATE INDEX tenders_application_end_idx ON tenders(application_end);
 CREATE INDEX tenders_reg_number_idx ON tenders(reg_number);
 
