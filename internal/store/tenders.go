@@ -371,7 +371,10 @@ func (s *Store) UpsertTender(ctx context.Context, in TenderUpsertInput) (*Tender
 		  published_at=COALESCE(EXCLUDED.published_at, tenders.published_at),
 		  updated_on_site=COALESCE(EXCLUDED.updated_on_site, tenders.updated_on_site),
 		  application_end=COALESCE(EXCLUDED.application_end, tenders.application_end),
-		  payload=EXCLUDED.payload,
+		  payload=CASE
+		    WHEN EXCLUDED.payload IS NULL OR EXCLUDED.payload = '{}'::jsonb THEN tenders.payload
+		    ELSE EXCLUDED.payload
+		  END,
 		  updated_at=now()
 		RETURNING id,reg_number,source_site,law,customer_id,object_name,status,nmck,currency,
 		  published_at,updated_on_site,application_end,analysis_status,payload,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -36,22 +35,20 @@ func NormalizeRetainReason(reason string) string {
 }
 
 // RetainTender marks a tender as workspace-retained so search-pool sync won't delete it.
-// If already retained, reason is upgraded only when the previous reason was weaker.
 func (s *Store) RetainTender(ctx context.Context, id uuid.UUID, reason string) (*Tender, error) {
 	reason = NormalizeRetainReason(reason)
-	now := time.Now().UTC()
 	tag, err := s.Pool.Exec(ctx, `
 		UPDATE tenders SET
 		  retained=true,
-		  retained_at=COALESCE(retained_at, $2),
+		  retained_at=COALESCE(retained_at, now()),
 		  retain_reason=CASE
-		    WHEN NOT retained THEN $3
-		    WHEN retain_reason IN ('', 'manual', 'analyzing') THEN $3
-		    WHEN $3 IN ('in_work','interesting','ai_interesting') THEN $3
+		    WHEN NOT retained THEN $2
+		    WHEN retain_reason IN ('', 'manual', 'analyzing') THEN $2
+		    WHEN $2 IN ('in_work','interesting','ai_interesting') THEN $2
 		    ELSE retain_reason
 		  END,
 		  updated_at=now()
-		WHERE id=$1`, id, now, reason)
+		WHERE id=$1`, id, reason)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +59,7 @@ func (s *Store) RetainTender(ctx context.Context, id uuid.UUID, reason string) (
 	return s.GetTender(ctx, id)
 }
 
-// UnretainTender removes workspace retention. Tender may then be deleted on next search sync
-// if it is no longer in the search pool.
+// UnretainTender removes workspace retention.
 func (s *Store) UnretainTender(ctx context.Context, id uuid.UUID) (*Tender, error) {
 	tag, err := s.Pool.Exec(ctx, `
 		UPDATE tenders SET retained=false, retained_at=NULL, retain_reason='', updated_at=now()
@@ -78,38 +74,58 @@ func (s *Store) UnretainTender(ctx context.Context, id uuid.UUID) (*Tender, erro
 	return s.GetTender(ctx, id)
 }
 
+// SyncItem — хит из zakupki-search.
+type SyncItem struct {
+	Reg        string
+	Site       string
+	Law        string
+	ObjectName string
+}
+
 type SyncSearchPoolResult struct {
+	CategoryID          uuid.UUID  `json:"category_id"`
+	Upserted            int        `json:"upserted"`
+	Enqueued            int        `json:"enqueued"`
+	JobID               *uuid.UUID `json:"job_id,omitempty"`
 	RemovedFromPool     int        `json:"removed_from_pool"`
 	KeptRetained        int        `json:"kept_retained"`
 	Deleted             int        `json:"deleted"`
-	Enqueued            int        `json:"enqueued"`
 	SkippedSameVersion  bool       `json:"skipped_same_version,omitempty"`
 	SyncedConfigVersion int64      `json:"synced_config_version"`
-	Job                 *IngestJob `json:"job,omitempty"`
+	Job                 *IngestJob `json:"-"`
 }
 
 type SyncSearchPoolOpts struct {
-	Items         []struct{ Reg, Site string }
+	Items         []SyncItem
 	Enqueue       bool
 	SourceName    string
 	ConfigVersion int64 // 0 = always apply
+	Title         string
 }
 
-// SyncSearchPool replaces the searcher-managed membership of a category.
-// Tenders absent from `items`:
-//   - if retained → unlinked from category, kept in DB (workspace)
-//   - if not retained and no other categories → deleted
-// When enqueue=true, creates an ingest job for the new pool items.
+// SyncSearchConfig — полный sync пула поисковика:
+// ensure category → upsert tenders + tender_categories → prune missing → optional ingest job.
+func (s *Store) SyncSearchConfig(ctx context.Context, searchConfigID string, opts SyncSearchPoolOpts) (*SyncSearchPoolResult, error) {
+	cat, err := s.EnsureCategoryBySearchConfig(ctx, searchConfigID, opts.Title)
+	if err != nil {
+		return nil, err
+	}
+	return s.SyncSearchPoolOpts(ctx, cat.ID, opts)
+}
+
+// SyncSearchPool replaces membership for an existing categoryID.
 func (s *Store) SyncSearchPool(ctx context.Context, categoryID uuid.UUID, items []struct{ Reg, Site string }, enqueue bool, sourceName string) (*SyncSearchPoolResult, error) {
+	rich := make([]SyncItem, 0, len(items))
+	for _, it := range items {
+		rich = append(rich, SyncItem{Reg: it.Reg, Site: it.Site})
+	}
 	return s.SyncSearchPoolOpts(ctx, categoryID, SyncSearchPoolOpts{
-		Items: items, Enqueue: enqueue, SourceName: sourceName,
+		Items: rich, Enqueue: enqueue, SourceName: sourceName,
 	})
 }
 
 func (s *Store) SyncSearchPoolOpts(ctx context.Context, categoryID uuid.UUID, opts SyncSearchPoolOpts) (*SyncSearchPoolResult, error) {
-	items := opts.Items
-	enqueue := opts.Enqueue
-	sourceName := opts.SourceName
+	out := &SyncSearchPoolResult{CategoryID: categoryID}
 
 	if opts.ConfigVersion > 0 {
 		var cur int64
@@ -118,15 +134,15 @@ func (s *Store) SyncSearchPoolOpts(ctx context.Context, categoryID uuid.UUID, op
 			return nil, err
 		}
 		if cur >= opts.ConfigVersion {
-			return &SyncSearchPoolResult{
-				SkippedSameVersion:  true,
-				SyncedConfigVersion: cur,
-			}, nil
+			out.SkippedSameVersion = true
+			out.SyncedConfigVersion = cur
+			return out, nil
 		}
 	}
+
 	wanted := map[string]struct{}{}
-	normItems := make([]struct{ Reg, Site string }, 0, len(items))
-	for _, it := range items {
+	normItems := make([]SyncItem, 0, len(opts.Items))
+	for _, it := range opts.Items {
 		reg := strings.TrimSpace(it.Reg)
 		site := strings.TrimSpace(it.Site)
 		if reg == "" {
@@ -140,9 +156,29 @@ func (s *Store) SyncSearchPoolOpts(ctx context.Context, categoryID uuid.UUID, op
 			continue
 		}
 		wanted[key] = struct{}{}
-		normItems = append(normItems, struct{ Reg, Site string }{Reg: reg, Site: site})
+		normItems = append(normItems, SyncItem{
+			Reg: reg, Site: site,
+			Law: strings.TrimSpace(it.Law), ObjectName: strings.TrimSpace(it.ObjectName),
+		})
 	}
 
+	// 1) Upsert each hit so GET /tenders?search_config_id= immediately returns rows.
+	for _, it := range normItems {
+		_, _, err := s.UpsertTender(ctx, TenderUpsertInput{
+			RegNumber:  it.Reg,
+			SourceSite: it.Site,
+			Law:        it.Law,
+			ObjectName: it.ObjectName,
+			CategoryID: categoryID,
+			Payload:    []byte(`{}`),
+		})
+		if err != nil {
+			return out, fmt.Errorf("upsert %s: %w", it.Reg, err)
+		}
+		out.Upserted++
+	}
+
+	// 2) Prune tenders that fell out of the search snapshot (keep retained).
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -177,7 +213,6 @@ func (s *Store) SyncSearchPoolOpts(ctx context.Context, categoryID uuid.UUID, op
 		return nil, err
 	}
 
-	out := &SyncSearchPoolResult{}
 	for _, r := range current {
 		key := r.reg + "\x00" + r.site
 		if _, ok := wanted[key]; ok {
@@ -218,15 +253,22 @@ func (s *Store) SyncSearchPoolOpts(ctx context.Context, categoryID uuid.UUID, op
 			Scan(&out.SyncedConfigVersion)
 	}
 
-	if enqueue && len(normItems) > 0 {
+	// 3) Optional ingest job so workers enrich cards via parser.
+	if opts.Enqueue && len(normItems) > 0 {
+		sourceName := opts.SourceName
 		if sourceName == "" {
 			sourceName = "search-sync"
 		}
-		job, err := s.CreateIngestJob(ctx, categoryID, sourceName, normItems)
+		plain := make([]struct{ Reg, Site string }, 0, len(normItems))
+		for _, it := range normItems {
+			plain = append(plain, struct{ Reg, Site string }{Reg: it.Reg, Site: it.Site})
+		}
+		job, err := s.CreateIngestJob(ctx, categoryID, sourceName, plain)
 		if err != nil {
 			return out, fmt.Errorf("pool synced but enqueue failed: %w", err)
 		}
 		out.Job = job
+		out.JobID = &job.ID
 		out.Enqueued = len(normItems)
 	}
 	return out, nil

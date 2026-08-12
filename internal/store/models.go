@@ -230,19 +230,49 @@ func (s *Store) GetCategoryBySearchConfigID(ctx context.Context, searchConfigID 
 		`SELECT `+categoryCols+` FROM categories WHERE search_config_id=$1`, searchConfigID))
 }
 
+func searchConfigSlug(searchConfigID string) string {
+	id := strings.TrimSpace(searchConfigID)
+	hex := strings.ReplaceAll(id, "-", "")
+	if len(hex) > 12 {
+		hex = hex[:12]
+	}
+	if hex == "" {
+		hex = uuid.NewString()[:12]
+	}
+	return "search-" + strings.ToLower(hex)
+}
+
 func (s *Store) CreateCategory(ctx context.Context, title, slug string) (*Category, error) {
 	return s.CreateCategoryWithSearchConfig(ctx, title, slug, "")
 }
 
+// CreateCategoryWithSearchConfig создаёт категорию. Если searchConfigID уже занят —
+// возвращает существующую (обновляя title при необходимости).
 func (s *Store) CreateCategoryWithSearchConfig(ctx context.Context, title, slug, searchConfigID string) (*Category, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return nil, fmt.Errorf("title required")
 	}
+	searchConfigID = strings.TrimSpace(searchConfigID)
+	if searchConfigID != "" {
+		if existing, err := s.GetCategoryBySearchConfigID(ctx, searchConfigID); err == nil {
+			if existing.Title != title && title != "" {
+				updated, uerr := s.UpdateCategory(ctx, existing.Slug, &title, nil, nil)
+				if uerr == nil {
+					return updated, nil
+				}
+			}
+			return existing, nil
+		} else if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+		if slug == "" {
+			slug = searchConfigSlug(searchConfigID)
+		}
+	}
 	if slug == "" {
 		slug = slugify(title)
 	}
-	searchConfigID = strings.TrimSpace(searchConfigID)
 	var searchPtr any
 	if searchConfigID != "" {
 		searchPtr = searchConfigID
@@ -253,6 +283,29 @@ func (s *Store) CreateCategoryWithSearchConfig(ctx context.Context, title, slug,
 		   title=EXCLUDED.title,
 		   search_config_id=COALESCE(EXCLUDED.search_config_id, categories.search_config_id)
 		 RETURNING `+categoryCols, slug, title, searchPtr))
+}
+
+// EnsureCategoryBySearchConfig — найти или создать список под search_config_id.
+func (s *Store) EnsureCategoryBySearchConfig(ctx context.Context, searchConfigID, title string) (*Category, error) {
+	searchConfigID = strings.TrimSpace(searchConfigID)
+	if searchConfigID == "" {
+		return nil, fmt.Errorf("search_config_id required")
+	}
+	if cat, err := s.GetCategoryBySearchConfigID(ctx, searchConfigID); err == nil {
+		if t := strings.TrimSpace(title); t != "" && t != cat.Title {
+			return s.UpdateCategory(ctx, cat.Slug, &t, nil, nil)
+		}
+		return cat, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	if strings.TrimSpace(title) == "" {
+		title = "search-" + searchConfigID
+		if len(title) > 64 {
+			title = title[:64]
+		}
+	}
+	return s.CreateCategoryWithSearchConfig(ctx, title, searchConfigSlug(searchConfigID), searchConfigID)
 }
 
 // UpdateCategory patches title/slug/search_config_id. Nil pointers mean "leave unchanged".

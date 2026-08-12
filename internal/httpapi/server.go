@@ -122,7 +122,15 @@ func (s *Server) createCategory(w http.ResponseWriter, r *http.Request) {
 	if sid == "" {
 		sid = strings.TrimSpace(body.SearchProfileID)
 	}
-	c, err := s.Store.CreateCategoryWithSearchConfig(r.Context(), body.Title, body.Slug, sid)
+	var (
+		c   *store.Category
+		err error
+	)
+	if sid != "" {
+		c, err = s.Store.EnsureCategoryBySearchConfig(r.Context(), sid, body.Title)
+	} else {
+		c, err = s.Store.CreateCategoryWithSearchConfig(r.Context(), body.Title, body.Slug, "")
+	}
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -596,26 +604,53 @@ func (s *Server) unretainTender(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, t)
 }
 
-func (s *Server) syncCategoryPool(w http.ResponseWriter, r *http.Request) {
-	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
+func (s *Server) syncSearchConfigPool(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	var body struct {
+		Title         string `json:"title"`
+		ConfigVersion int64  `json:"config_version"`
+		Items         []struct {
+			RegNumber  string `json:"reg_number"`
+			SourceSite string `json:"source_site"`
+			NoticeURL  string `json:"notice_url"`
+			Law        string `json:"law"`
+			ObjectName string `json:"object_name"`
+		} `json:"items"`
+		Enqueue    *bool  `json:"enqueue"`
+		SourceName string `json:"source_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, err)
+		return
+	}
+	items := make([]store.SyncItem, 0, len(body.Items))
+	for _, it := range body.Items {
+		site := strings.TrimSpace(it.SourceSite)
+		if site == "" && strings.TrimSpace(it.NoticeURL) != "" {
+			site = "https://zakupki.gov.ru"
+		}
+		items = append(items, store.SyncItem{
+			Reg: it.RegNumber, Site: site, Law: it.Law, ObjectName: it.ObjectName,
+		})
+	}
+	enqueue := true
+	if body.Enqueue != nil {
+		enqueue = *body.Enqueue
+	}
+	s.Control.ResumeIngest()
+	res, err := s.Store.SyncSearchConfig(r.Context(), id, store.SyncSearchPoolOpts{
+		Items: items, Enqueue: enqueue, SourceName: body.SourceName,
+		ConfigVersion: body.ConfigVersion, Title: body.Title,
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	s.syncPool(w, r, cat)
+	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) syncSearchConfigPool(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.PathValue("id"))
-	cat, err := s.Store.GetCategoryBySearchConfigID(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		// Первый sync от zakupki-search — создаём список под profile id.
-		title := "search-" + id
-		if len(title) > 64 {
-			title = title[:64]
-		}
-		cat, err = s.Store.CreateCategoryWithSearchConfig(r.Context(), title, "", id)
-	}
+func (s *Server) syncCategoryPool(w http.ResponseWriter, r *http.Request) {
+	cat, err := s.Store.GetCategoryBySlug(r.Context(), r.PathValue("slug"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -628,11 +663,13 @@ func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Cat
 		SearchProfileID string `json:"search_profile_id"`
 		SearchConfigID  string `json:"search_config_id"`
 		ConfigVersion   int64  `json:"config_version"`
+		Title           string `json:"title"`
 		Items           []struct {
 			RegNumber  string `json:"reg_number"`
 			SourceSite string `json:"source_site"`
 			NoticeURL  string `json:"notice_url"`
 			Law        string `json:"law"`
+			ObjectName string `json:"object_name"`
 		} `json:"items"`
 		Enqueue    *bool  `json:"enqueue"`
 		SourceName string `json:"source_name"`
@@ -641,7 +678,6 @@ func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Cat
 		writeErr(w, err)
 		return
 	}
-	// Если в теле другой profile id — перепроверим / привяжем.
 	wantID := strings.TrimSpace(body.SearchProfileID)
 	if wantID == "" {
 		wantID = strings.TrimSpace(body.SearchConfigID)
@@ -654,13 +690,15 @@ func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Cat
 		}
 		cat = updated
 	}
-	items := make([]struct{ Reg, Site string }, 0, len(body.Items))
+	items := make([]store.SyncItem, 0, len(body.Items))
 	for _, it := range body.Items {
 		site := strings.TrimSpace(it.SourceSite)
 		if site == "" && strings.TrimSpace(it.NoticeURL) != "" {
-			site = strings.TrimSpace(it.NoticeURL)
+			site = "https://zakupki.gov.ru"
 		}
-		items = append(items, struct{ Reg, Site string }{Reg: it.RegNumber, Site: site})
+		items = append(items, store.SyncItem{
+			Reg: it.RegNumber, Site: site, Law: it.Law, ObjectName: it.ObjectName,
+		})
 	}
 	enqueue := true
 	if body.Enqueue != nil {
@@ -668,20 +706,14 @@ func (s *Server) syncPool(w http.ResponseWriter, r *http.Request, cat *store.Cat
 	}
 	s.Control.ResumeIngest()
 	res, err := s.Store.SyncSearchPoolOpts(r.Context(), cat.ID, store.SyncSearchPoolOpts{
-		Items: items, Enqueue: enqueue, SourceName: body.SourceName, ConfigVersion: body.ConfigVersion,
+		Items: items, Enqueue: enqueue, SourceName: body.SourceName,
+		ConfigVersion: body.ConfigVersion, Title: body.Title,
 	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	fresh, _ := s.Store.GetCategoryBySlug(r.Context(), cat.Slug)
-	if fresh != nil {
-		cat = fresh
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"category": cat,
-		"sync":     res,
-	})
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {

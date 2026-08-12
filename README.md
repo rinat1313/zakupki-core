@@ -23,7 +23,7 @@
 | Тендеры списка | `GET /api/v1/tenders?search_config_id=...` или `?category=slug` |
 | Загрузить CSV в список | `POST /api/v1/ingest` (`search_config_id` / `category_slug`) |
 | Пуш результатов поисковика | `POST /api/v1/ingest/items` (JSON + `search_config_id`) |
-| Sync пула (контракт search) | `POST /api/v1/search-profiles/{id}/sync` (`search_profile_id`, `config_version`, `items`) |
+| Sync пула (контракт search) | `POST /api/v1/categories/by-search-config/{id}/sync` `{items, enqueue}` → upsert tenders + optional ingest |
 | Auto-AI для поисковика | `PUT /api/v1/categories/by-search-profile/{id}/auto-ai` `{enabled:true}` |
 | Сохранить тендер вне пула | `POST /api/v1/tenders/{id}/retain` (`interesting` / `in_work` / `manual`) |
 | Workspace (сохранённые) | `GET /api/v1/tenders?retained=true` |
