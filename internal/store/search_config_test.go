@@ -11,6 +11,12 @@ func TestSearchConfigSlug(t *testing.T) {
 	}
 }
 
+func TestNeedAIConfigError(t *testing.T) {
+	if ErrNeedAIConfig == nil || ErrNeedAIConfig.Error() == "" {
+		t.Fatal("ErrNeedAIConfig must be set")
+	}
+}
+
 func TestNormalizeRetainReason(t *testing.T) {
 	cases := map[string]string{
 		"":            RetainReasonManual,

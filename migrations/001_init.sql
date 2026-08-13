@@ -19,6 +19,7 @@ CREATE TABLE categories (
   title                  TEXT NOT NULL,
   search_config_id       TEXT,
   auto_ai                BOOLEAN NOT NULL DEFAULT FALSE,
+  archived               BOOLEAN NOT NULL DEFAULT FALSE,
   synced_config_version  BIGINT NOT NULL DEFAULT 0,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );

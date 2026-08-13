@@ -186,13 +186,12 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// NextTenderReadyForAI — ingest завершён (ok), есть текст; не ждём process_status всех документов.
-// Если globalAutoAI=false, берёт только тендеры категорий с categories.auto_ai=true.
+// NextTenderReadyForAI — ingest ok, есть текст, категория с auto_ai + чек-лист и не в архиве.
 func (s *Store) NextTenderReadyForAI(ctx context.Context) (*Tender, error) {
-	return s.NextTenderReadyForAIScoped(ctx, true)
+	return s.NextTenderReadyForAIScoped(ctx, false)
 }
 
-func (s *Store) NextTenderReadyForAIScoped(ctx context.Context, globalAutoAI bool) (*Tender, error) {
+func (s *Store) NextTenderReadyForAIScoped(ctx context.Context, _ bool) (*Tender, error) {
 	var id uuid.UUID
 	err := s.Pool.QueryRow(ctx, `
 		SELECT t.id FROM tenders t
@@ -209,16 +208,16 @@ func (s *Store) NextTenderReadyForAIScoped(ctx context.Context, globalAutoAI boo
 		    WHERE d.tender_id=t.id AND NOT d.removed
 		      AND d.text_content IS NOT NULL AND length(trim(d.text_content))>0
 		  )
-		  AND (
-		    $1::bool
-		    OR EXISTS (
-		      SELECT 1 FROM tender_categories tc
-		      JOIN categories c ON c.id=tc.category_id
-		      WHERE tc.tender_id=t.id AND c.auto_ai
-		    )
+		  AND EXISTS (
+		    SELECT 1 FROM tender_categories tc
+		    JOIN categories c ON c.id=tc.category_id
+		    WHERE tc.tender_id=t.id
+		      AND c.auto_ai
+		      AND NOT c.archived
+		      AND c.active_ai_config_id IS NOT NULL
 		  )
 		ORDER BY t.updated_at ASC
-		LIMIT 1`, globalAutoAI).Scan(&id)
+		LIMIT 1`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

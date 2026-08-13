@@ -18,7 +18,8 @@
 |----------|--------|
 | Создать список (+ `search_config_id`) | `POST /api/v1/categories` |
 | Список / получить / по search config | `GET /api/v1/categories`, `.../{slug}`, `.../by-search-config/{id}` |
-| Редактировать | `PATCH /api/v1/categories/{slug}` |
+| Редактировать (`auto_ai`, `archived`, title…) | `PATCH /api/v1/categories/{slug}` |
+| Список (без архива по умолчанию) | `GET /api/v1/categories?archived=false` (`true` / `all`) |
 | Удалить список | `DELETE /api/v1/categories/{slug}` |
 | Тендеры списка | `GET /api/v1/tenders?search_config_id=...` или `?category=slug` |
 | Загрузить CSV в список | `POST /api/v1/ingest` (`search_config_id` / `category_slug`) |
@@ -43,7 +44,7 @@
 **Сбор + AI по выбранному поисковику (UI «Поисковики»):**
 1. Search/gateway шлёт sync snapshot → core создаёт/обновляет список (`search_profile_id`)
 2. Ingest воркеры собирают карточки/документы (`enqueue: true`)
-3. `PUT .../auto-ai {enabled:true}` на категории поисковика → auto-AI берёт только его готовые тендеры
+3. `PUT .../auto-ai {enabled:true}` или `PATCH {auto_ai:true}` — только если есть `active_ai_config_id`; воркер берёт тендеры категорий с `auto_ai=true`, чек-листом и не `archived`.
 4. UI читает `GET /tenders?search_profile_id=...` (`collect_pct`, `ai_pct`, `assess_summary`, `card_tone`)
 
 ```json
@@ -75,7 +76,7 @@ export PARSER_URL=http://127.0.0.1:8091
 go run ./cmd/core
 ```
 
-Миграции: `migrations/001_init.sql`, `migrations/002_category_search_config.sql`
+Миграции: `migrations/001_init.sql` … `migrations/005_category_archived.sql`
 (также применяются идемпотентно из `store.Migrate` при старте).
 
 Полный стек: [zakupki-platform](https://github.com/rinat1313/zakupki-platform).

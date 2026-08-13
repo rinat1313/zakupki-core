@@ -15,6 +15,9 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+// ErrNeedAIConfig — auto_ai=true без активного чек-листа категории.
+var ErrNeedAIConfig = errors.New("нельзя включить auto_ai без активного чек-листа (active_ai_config_id)")
+
 type Category struct {
 	ID               uuid.UUID  `json:"id"`
 	Slug             string     `json:"slug"`
@@ -23,12 +26,13 @@ type Category struct {
 	SearchConfigID *string `json:"search_config_id,omitempty"`
 	// SearchProfileID — алиас search_config_id для контракта zakupki-search / UI.
 	SearchProfileID *string `json:"search_profile_id,omitempty"`
-	// AutoAI — включить автосбор AI-анализа для тендеров этого поисковика.
-	AutoAI               bool       `json:"auto_ai"`
-	SyncedConfigVersion  int64      `json:"synced_config_version"`
-	ActiveAIConfigID     *uuid.UUID `json:"active_ai_config_id,omitempty"`
-	TendersCount         int        `json:"tenders_count,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
+	// AutoAI — авто-анализ тендеров этой категории (нужен active_ai_config_id).
+	AutoAI              bool       `json:"auto_ai"`
+	Archived            bool       `json:"archived"`
+	SyncedConfigVersion int64      `json:"synced_config_version"`
+	ActiveAIConfigID    *uuid.UUID `json:"active_ai_config_id"`
+	TendersCount        int        `json:"tenders_count,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 type Customer struct {
@@ -180,7 +184,7 @@ func decorateCategory(c *Category) {
 
 func scanCategory(row pgx.Row) (*Category, error) {
 	var c Category
-	err := row.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.AutoAI, &c.SyncedConfigVersion, &c.ActiveAIConfigID, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.AutoAI, &c.Archived, &c.SyncedConfigVersion, &c.ActiveAIConfigID, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -191,15 +195,25 @@ func scanCategory(row pgx.Row) (*Category, error) {
 	return &c, nil
 }
 
-const categoryCols = `id, slug, title, search_config_id, COALESCE(auto_ai,false), COALESCE(synced_config_version,0), active_ai_config_id, created_at`
+const categoryCols = `id, slug, title, search_config_id, COALESCE(auto_ai,false), COALESCE(archived,false), COALESCE(synced_config_version,0), active_ai_config_id, created_at`
 
-func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
-	rows, err := s.Pool.Query(ctx, `
-		SELECT c.id, c.slug, c.title, c.search_config_id, COALESCE(c.auto_ai,false), COALESCE(c.synced_config_version,0),
-		       c.active_ai_config_id, c.created_at,
+// archivedFilter: ""/"false" — только неархивные; "true" — только архив; "all" — все.
+func (s *Store) ListCategories(ctx context.Context, archivedFilter string) ([]Category, error) {
+	q := `
+		SELECT c.id, c.slug, c.title, c.search_config_id, COALESCE(c.auto_ai,false), COALESCE(c.archived,false),
+		       COALESCE(c.synced_config_version,0), c.active_ai_config_id, c.created_at,
 		       COALESCE((SELECT count(*) FROM tender_categories tc WHERE tc.category_id=c.id),0)
-		FROM categories c
-		ORDER BY c.title`)
+		FROM categories c`
+	switch strings.ToLower(strings.TrimSpace(archivedFilter)) {
+	case "true", "1", "yes":
+		q += ` WHERE c.archived`
+	case "all":
+		// no filter
+	default:
+		q += ` WHERE NOT c.archived`
+	}
+	q += ` ORDER BY c.title`
+	rows, err := s.Pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -207,8 +221,8 @@ func (s *Store) ListCategories(ctx context.Context) ([]Category, error) {
 	var out []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.AutoAI, &c.SyncedConfigVersion,
-			&c.ActiveAIConfigID, &c.CreatedAt, &c.TendersCount); err != nil {
+		if err := rows.Scan(&c.ID, &c.Slug, &c.Title, &c.SearchConfigID, &c.AutoAI, &c.Archived,
+			&c.SyncedConfigVersion, &c.ActiveAIConfigID, &c.CreatedAt, &c.TendersCount); err != nil {
 			return nil, err
 		}
 		decorateCategory(&c)
@@ -257,7 +271,7 @@ func (s *Store) CreateCategoryWithSearchConfig(ctx context.Context, title, slug,
 	if searchConfigID != "" {
 		if existing, err := s.GetCategoryBySearchConfigID(ctx, searchConfigID); err == nil {
 			if existing.Title != title && title != "" {
-				updated, uerr := s.UpdateCategory(ctx, existing.Slug, &title, nil, nil)
+				updated, uerr := s.PatchCategory(ctx, existing.Slug, CategoryPatch{Title: &title})
 				if uerr == nil {
 					return updated, nil
 				}
@@ -293,7 +307,7 @@ func (s *Store) EnsureCategoryBySearchConfig(ctx context.Context, searchConfigID
 	}
 	if cat, err := s.GetCategoryBySearchConfigID(ctx, searchConfigID); err == nil {
 		if t := strings.TrimSpace(title); t != "" && t != cat.Title {
-			return s.UpdateCategory(ctx, cat.Slug, &t, nil, nil)
+			return s.PatchCategory(ctx, cat.Slug, CategoryPatch{Title: &t})
 		}
 		return cat, nil
 	} else if !errors.Is(err, ErrNotFound) {
@@ -308,30 +322,41 @@ func (s *Store) EnsureCategoryBySearchConfig(ctx context.Context, searchConfigID
 	return s.CreateCategoryWithSearchConfig(ctx, title, searchConfigSlug(searchConfigID), searchConfigID)
 }
 
-// UpdateCategory patches title/slug/search_config_id. Nil pointers mean "leave unchanged".
-// Empty searchConfigID string clears the binding.
+type CategoryPatch struct {
+	Title          *string
+	Slug           *string
+	SearchConfigID *string
+	AutoAI         *bool
+	Archived       *bool
+}
+
 func (s *Store) UpdateCategory(ctx context.Context, slug string, title, newSlug, searchConfigID *string) (*Category, error) {
+	return s.PatchCategory(ctx, slug, CategoryPatch{Title: title, Slug: newSlug, SearchConfigID: searchConfigID})
+}
+
+// PatchCategory applies a partial update. Nil pointers mean "leave unchanged".
+func (s *Store) PatchCategory(ctx context.Context, slug string, p CategoryPatch) (*Category, error) {
 	cur, err := s.GetCategoryBySlug(ctx, slug)
 	if err != nil {
 		return nil, err
 	}
-	if title != nil {
-		t := strings.TrimSpace(*title)
+	if p.Title != nil {
+		t := strings.TrimSpace(*p.Title)
 		if t == "" {
 			return nil, fmt.Errorf("title required")
 		}
 		cur.Title = t
 	}
-	if newSlug != nil {
-		ns := strings.TrimSpace(*newSlug)
+	if p.Slug != nil {
+		ns := strings.TrimSpace(*p.Slug)
 		if ns == "" {
 			return nil, fmt.Errorf("slug required")
 		}
 		cur.Slug = ns
 	}
 	var searchPtr any
-	if searchConfigID != nil {
-		v := strings.TrimSpace(*searchConfigID)
+	if p.SearchConfigID != nil {
+		v := strings.TrimSpace(*p.SearchConfigID)
 		if v == "" {
 			cur.SearchConfigID = nil
 			searchPtr = nil
@@ -342,26 +367,39 @@ func (s *Store) UpdateCategory(ctx context.Context, slug string, title, newSlug,
 	} else if cur.SearchConfigID != nil {
 		searchPtr = *cur.SearchConfigID
 	}
+	if p.Archived != nil {
+		cur.Archived = *p.Archived
+	}
+	if p.AutoAI != nil {
+		if *p.AutoAI && cur.ActiveAIConfigID == nil {
+			return nil, ErrNeedAIConfig
+		}
+		cur.AutoAI = *p.AutoAI
+	}
 	return scanCategory(s.Pool.QueryRow(ctx, `
-		UPDATE categories SET slug=$2, title=$3, search_config_id=$4
+		UPDATE categories SET slug=$2, title=$3, search_config_id=$4, auto_ai=$5, archived=$6
 		WHERE id=$1
-		RETURNING `+categoryCols, cur.ID, cur.Slug, cur.Title, searchPtr))
+		RETURNING `+categoryCols, cur.ID, cur.Slug, cur.Title, searchPtr, cur.AutoAI, cur.Archived))
 }
 
 func (s *Store) SetCategoryAutoAI(ctx context.Context, categoryID uuid.UUID, enabled bool) (*Category, error) {
-	tag, err := s.Pool.Exec(ctx, `UPDATE categories SET auto_ai=$2 WHERE id=$1`, categoryID, enabled)
+	cur, err := scanCategory(s.Pool.QueryRow(ctx, `SELECT `+categoryCols+` FROM categories WHERE id=$1`, categoryID))
 	if err != nil {
 		return nil, err
 	}
-	if tag.RowsAffected() == 0 {
-		return nil, ErrNotFound
+	if enabled && cur.ActiveAIConfigID == nil {
+		return nil, ErrNeedAIConfig
 	}
-	return scanCategory(s.Pool.QueryRow(ctx, `SELECT `+categoryCols+` FROM categories WHERE id=$1`, categoryID))
+	return scanCategory(s.Pool.QueryRow(ctx, `
+		UPDATE categories SET auto_ai=$2 WHERE id=$1
+		RETURNING `+categoryCols, categoryID, enabled))
 }
 
 func (s *Store) AnyCategoryAutoAI(ctx context.Context) (bool, error) {
 	var n int
-	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM categories WHERE auto_ai`).Scan(&n)
+	err := s.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM categories
+		WHERE auto_ai AND NOT archived AND active_ai_config_id IS NOT NULL`).Scan(&n)
 	return n > 0, err
 }
 

@@ -98,7 +98,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listCategories(w http.ResponseWriter, r *http.Request) {
-	list, err := s.Store.ListCategories(r.Context())
+	filter := r.URL.Query().Get("archived")
+	if filter == "" {
+		filter = "false"
+	}
+	list, err := s.Store.ListCategories(r.Context(), filter)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -170,6 +174,7 @@ func (s *Server) patchCategory(w http.ResponseWriter, r *http.Request) {
 		SearchConfigID  *string `json:"search_config_id"`
 		SearchProfileID *string `json:"search_profile_id"`
 		AutoAI          *bool   `json:"auto_ai"`
+		Archived        *bool   `json:"archived"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, err)
@@ -179,17 +184,16 @@ func (s *Server) patchCategory(w http.ResponseWriter, r *http.Request) {
 	if sid == nil {
 		sid = body.SearchProfileID
 	}
-	c, err := s.Store.UpdateCategory(r.Context(), r.PathValue("slug"), body.Title, body.Slug, sid)
+	c, err := s.Store.PatchCategory(r.Context(), r.PathValue("slug"), store.CategoryPatch{
+		Title:          body.Title,
+		Slug:           body.Slug,
+		SearchConfigID: sid,
+		AutoAI:         body.AutoAI,
+		Archived:       body.Archived,
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
-	}
-	if body.AutoAI != nil {
-		c, err = s.Store.SetCategoryAutoAI(r.Context(), c.ID, *body.AutoAI)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
 	}
 	writeJSON(w, http.StatusOK, c)
 }
@@ -1162,6 +1166,9 @@ func writeErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	if errors.Is(err, store.ErrNotFound) {
 		code = http.StatusNotFound
+	}
+	if errors.Is(err, store.ErrNeedAIConfig) {
+		code = http.StatusBadRequest
 	}
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }

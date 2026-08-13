@@ -79,8 +79,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		`ALTER TABLE tenders ADD COLUMN IF NOT EXISTS retain_reason TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS tenders_retained_idx ON tenders (retained) WHERE retained`,
 		`ALTER TABLE categories ADD COLUMN IF NOT EXISTS auto_ai BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE categories ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE categories ADD COLUMN IF NOT EXISTS synced_config_version BIGINT NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS categories_auto_ai_idx ON categories (auto_ai) WHERE auto_ai`,
+		`CREATE INDEX IF NOT EXISTS categories_archived_idx ON categories (archived)`,
 	}
 	for _, q := range stmts {
 		if _, err := pool.Exec(ctx, q); err != nil {

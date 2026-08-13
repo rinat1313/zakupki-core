@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/rinat1313/zakupki-core/internal/store"
 )
 
 func TestNewDoesNotPanicOnCategoryRoutes(t *testing.T) {
@@ -39,6 +41,8 @@ func TestMatchCategoryRoute(t *testing.T) {
 		{http.MethodPost, "/api/v1/categories/by-search-config/cfg-1/sync", catRoutePostSearchSync, "", "cfg-1"},
 		{http.MethodPost, "/api/v1/categories/by-search-profile/prof-9/sync", catRoutePostSearchSync, "", "prof-9"},
 		{http.MethodGet, "/api/v1/categories/my-slug", catRouteGet, "my-slug", ""},
+		{http.MethodPatch, "/api/v1/categories/my-slug", catRoutePatch, "my-slug", ""},
+		{http.MethodDelete, "/api/v1/categories/my-slug", catRouteDelete, "my-slug", ""},
 		{http.MethodDelete, "/api/v1/categories/my-slug/tenders", catRouteDeleteTenders, "my-slug", ""},
 		{http.MethodPut, "/api/v1/categories/my-slug/ai-configs/abc", catRoutePutAIConfig, "my-slug", "abc"},
 	}
@@ -122,5 +126,13 @@ func TestSearchProfilesSyncStillOnMux(t *testing.T) {
 	// Default mux 404 body is plain "404 page not found\n" without JSON error.
 	if rec.Code == http.StatusNotFound && string(body) == "404 page not found\n" {
 		t.Fatal("search-profiles sync not registered on mux")
+	}
+}
+
+func TestWriteErrNeedAIConfigIs400(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeErr(rec, store.ErrNeedAIConfig)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400", rec.Code)
 	}
 }

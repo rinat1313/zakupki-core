@@ -52,7 +52,7 @@ func (w *Worker) tick(ctx context.Context) {
 	}
 	globalOn := w.Control.AutoAIEnabled()
 	catOn, _ := w.Store.AnyCategoryAutoAI(ctx)
-	// Глобальный Auto (каталог) или Auto AI у конкретного поисковика/категории.
+	// Глобальный мастер (анализатор доступен) ИЛИ хотя бы одна категория с auto_ai+чек-листом.
 	if !globalOn && !catOn {
 		return
 	}
@@ -65,7 +65,7 @@ func (w *Worker) tick(ctx context.Context) {
 		if !ok {
 			return
 		}
-		tender, err := w.Store.NextTenderReadyForAIScoped(ctx, globalOn)
+		tender, err := w.Store.NextTenderReadyForAI(ctx)
 		if err != nil {
 			release()
 			if !errors.Is(err, store.ErrNotFound) {
