@@ -1,0 +1,1396 @@
+openapi: 3.0.3
+info:
+  title: zakupki-core API
+  description: |
+    Доменный HTTP API платформы закупок (`zakupki-core`).
+
+    Сервис хранит категории, тендеры, документы и заказчиков в PostgreSQL,
+    принимает CSV на ingest, отдаёт задачи воркерам (вызов `zakupki-parser`)
+    и запускает AI-оценку через `analizator_zakupok`.
+  version: 1.0.0
+  contact:
+    name: zakupki-platform
+
+servers:
+  - url: http://localhost:8080
+    description: Local default (`HTTP_ADDR=:8080`)
+
+tags:
+  - name: Health
+    description: Проверка доступности сервиса и анализатора
+  - name: Categories
+    description: Категории тендеров и AI-конфигурации
+  - name: Ingest
+    description: Загрузка CSV, очередь сбора, логи и статистика
+  - name: Tenders
+    description: Тендеры, документы, события, AI-оценка
+  - name: Workers
+    description: Управление ingest-воркерами и авто-AI
+  - name: Customers
+    description: Заказчики (контрагенты)
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Сервис отвечает
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/v1/categories:
+    get:
+      tags: [Categories]
+      summary: Список категорий
+      operationId: listCategories
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Category"
+    post:
+      tags: [Categories]
+      summary: Создать или обновить категорию по slug
+      operationId: createCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCategoryRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}:
+    get:
+      tags: [Categories]
+      summary: Категория по slug
+      operationId: getCategory
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}/tenders:
+    delete:
+      tags: [Categories]
+      summary: Удалить все тендеры категории
+      operationId: clearCategoryTenders
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletedCount"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}/jobs:
+    delete:
+      tags: [Categories]
+      summary: Удалить ingest-задачи категории
+      operationId: clearCategoryJobs
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletedCount"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}/refresh:
+    post:
+      tags: [Categories]
+      summary: Поставить тендеры категории на повторный сбор
+      operationId: refreshCategory
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "202":
+          description: Job создан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestJob"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}/ai-configs:
+    get:
+      tags: [Categories]
+      summary: AI-конфиги категории
+      operationId: listAIConfigs
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AIConfigListResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [Categories]
+      summary: Создать AI-конфиг
+      operationId: createAIConfig
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAIConfigRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AIConfig"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}/ai-configs/{id}:
+    put:
+      tags: [Categories]
+      summary: Обновить AI-конфиг
+      operationId: updateAIConfig
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+        - $ref: "#/components/parameters/UUIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAIConfigRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AIConfig"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Categories]
+      summary: Удалить AI-конфиг
+      operationId: deleteAIConfig
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusOK"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/categories/{slug}/active-ai-config:
+    put:
+      tags: [Categories]
+      summary: Назначить активный AI-конфиг категории
+      description: Запрещено при включённом Авто AI (`409`).
+      operationId: setActiveAIConfig
+      parameters:
+        - $ref: "#/components/parameters/CategorySlug"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetActiveAIConfigRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "409":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/ingest:
+    post:
+      tags: [Ingest]
+      summary: Загрузить CSV и создать ingest job
+      description: |
+        `multipart/form-data`: поле `file` (CSV), плюс `category_slug` и/или `category_title`.
+        Новая загрузка возобновляет ingest, если он был на паузе/остановлен.
+      operationId: ingestCSV
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV со списком закупок (reg_number / source_site)
+                category_slug:
+                  type: string
+                category_title:
+                  type: string
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestJob"
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/ingest/jobs:
+    get:
+      tags: [Ingest]
+      summary: Список ingest jobs
+      operationId: listIngestJobs
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IngestJob"
+
+  /api/v1/ingest/jobs/{id}:
+    get:
+      tags: [Ingest]
+      summary: Job и его items
+      operationId: getIngestJob
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestJobDetail"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Ingest]
+      summary: Удалить job
+      operationId: deleteIngestJob
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "204":
+          description: No Content
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/ingest/jobs/{id}/logs:
+    get:
+      tags: [Ingest]
+      summary: Логи job (инкрементально)
+      operationId: getIngestJobLogs
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+        - name: after
+          in: query
+          schema:
+            type: integer
+            format: int64
+            default: 0
+          description: Вернуть записи с id > after
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JobLog"
+
+  /api/v1/stats/ingest:
+    get:
+      tags: [Ingest]
+      summary: Статистика ingest по категориям
+      operationId: getIngestStats
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IngestStatsRow"
+
+  /api/v1/tenders:
+    get:
+      tags: [Tenders]
+      summary: Список тендеров
+      operationId: listTenders
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+          description: Фильтр по slug категории
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Поиск по регномеру / названию
+        - name: status
+          in: query
+          schema:
+            type: string
+          description: Фильтр по analysis_status или статусу
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Tender"
+
+  /api/v1/tenders/{id}:
+    get:
+      tags: [Tenders]
+      summary: Тендер (с customer, если есть)
+      operationId: getTender
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenderDetail"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Tenders]
+      summary: Частичное обновление тендера
+      operationId: patchTender
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchTenderRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tender"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Tenders]
+      summary: Удалить тендер
+      operationId: deleteTender
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "204":
+          description: No Content
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/tenders/{id}/refresh:
+    post:
+      tags: [Tenders]
+      summary: Повторный сбор одного тендера
+      operationId: refreshTender
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "202":
+          description: Job создан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestJob"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/tenders/{id}/documents:
+    get:
+      tags: [Tenders]
+      summary: Документы тендера
+      operationId: listTenderDocuments
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+        - name: text
+          in: query
+          schema:
+            type: string
+            enum: ["1", "true"]
+          description: Включить text_content
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Document"
+
+  /api/v1/tenders/{id}/events:
+    get:
+      tags: [Tenders]
+      summary: События тендера
+      operationId: listTenderEvents
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TenderEvent"
+
+  /api/v1/tenders/{id}/assessment:
+    get:
+      tags: [Tenders]
+      summary: AI-оценка тендера
+      description: Если оценки нет — возвращает пустой объект с `summary=""`.
+      operationId: getAssessment
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Assessment"
+    put:
+      tags: [Tenders]
+      summary: Сохранить/обновить оценку вручную
+      operationId: putAssessment
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssessmentInput"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Assessment"
+
+  /api/v1/tenders/{id}/analyze:
+    post:
+      tags: [Tenders]
+      summary: Запустить AI-анализ тендера
+      description: Требует `ANALIZATOR_URL`.
+      operationId: analyzeTender
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnalyzeRequest"
+      responses:
+        "200":
+          description: Анализ выполнен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assessment:
+                    $ref: "#/components/schemas/Assessment"
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/workers:
+    get:
+      tags: [Workers]
+      summary: Статус воркеров и авто-AI
+      operationId: getWorkersStatus
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkersStatus"
+
+  /api/v1/workers/auto-ai:
+    put:
+      tags: [Workers]
+      summary: Включить/выключить Авто AI
+      operationId: setAutoAI
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAutoAIRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkersStatus"
+        "400":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/workers/ingest/pause:
+    post:
+      tags: [Workers]
+      summary: Пауза ingest
+      operationId: pauseIngest
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkersStatus"
+
+  /api/v1/workers/ingest/resume:
+    post:
+      tags: [Workers]
+      summary: Возобновить ingest
+      operationId: resumeIngest
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkersStatus"
+
+  /api/v1/workers/ingest/stop:
+    post:
+      tags: [Workers]
+      summary: Остановить ingest и отменить активные items
+      operationId: stopIngest
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkersStatusStop"
+
+  /api/v1/workers/analyze/stop:
+    post:
+      tags: [Workers]
+      summary: Остановить текущие AI-анализы
+      operationId: stopAnalyze
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkersStatus"
+
+  /api/v1/customers:
+    get:
+      tags: [Customers]
+      summary: Список заказчиков
+      operationId: listCustomers
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Поиск по ИНН / названию / КПП
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Customer"
+    post:
+      tags: [Customers]
+      summary: Создать или upsert заказчика (по inn+kpp)
+      operationId: createCustomer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomerInput"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+
+  /api/v1/customers/{id}:
+    get:
+      tags: [Customers]
+      summary: Заказчик по id
+      operationId: getCustomer
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Customers]
+      summary: Обновить заказчика
+      operationId: patchCustomer
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomerInput"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Customers]
+      summary: Удалить заказчика
+      operationId: deleteCustomer
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "204":
+          description: No Content
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/customers/{id}/courts:
+    get:
+      tags: [Customers]
+      summary: Судебные дела (stub)
+      description: Заглушка — всегда пустой массив.
+      operationId: listCustomerCourts
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+
+  /api/v1/customers/{id}/rnp:
+    get:
+      tags: [Customers]
+      summary: РНП (stub)
+      description: Заглушка — всегда пустой массив.
+      operationId: listCustomerRNP
+      parameters:
+        - $ref: "#/components/parameters/UUIDPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+
+components:
+  parameters:
+    CategorySlug:
+      name: slug
+      in: path
+      required: true
+      schema:
+        type: string
+    UUIDPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    StatusOK:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+
+    DeletedCount:
+      type: object
+      properties:
+        deleted:
+          type: integer
+          format: int64
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        analizator:
+          type: string
+          description: ok | unavailable | disabled
+        analizator_url:
+          type: string
+        analizator_error:
+          type: string
+
+    Category:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        title:
+          type: string
+        active_ai_config_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    CreateCategoryRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        slug:
+          type: string
+          description: Если пусто — генерируется из title
+
+    AIConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        category_slug:
+          type: string
+        name:
+          type: string
+        system_prompt:
+          type: string
+        user_prompt:
+          type: string
+        rules:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AIConfigListResponse:
+      type: object
+      properties:
+        configs:
+          type: array
+          items:
+            $ref: "#/components/schemas/AIConfig"
+        active_ai_config_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    CreateAIConfigRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        system_prompt:
+          type: string
+        user_prompt:
+          type: string
+        rules:
+          type: string
+        activate:
+          type: boolean
+          description: Сделать конфиг активным (если Авто AI выкл.)
+
+    UpdateAIConfigRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        system_prompt:
+          type: string
+        user_prompt:
+          type: string
+        rules:
+          type: string
+
+    SetActiveAIConfigRequest:
+      type: object
+      properties:
+        config_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: null или пустая строка — сбросить активный конфиг
+
+    RefreshRequest:
+      type: object
+      properties:
+        statuses:
+          type: array
+          items:
+            type: string
+          description: Фильтр по analysis_status
+        tender_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    IngestJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        category_slug:
+          type: string
+        category_title:
+          type: string
+        source_name:
+          type: string
+        status:
+          type: string
+          example: queued
+        total_items:
+          type: integer
+        done_items:
+          type: integer
+        error_items:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    IngestItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+        reg_number:
+          type: string
+        source_site:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, ok, error, skipped, unsupported_source, failed_analyze]
+        error:
+          type: string
+        tender_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    IngestJobDetail:
+      type: object
+      properties:
+        job:
+          $ref: "#/components/schemas/IngestJob"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/IngestItem"
+
+    JobLog:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        job_id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+          nullable: true
+        reg_number:
+          type: string
+        level:
+          type: string
+        message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    IngestStatsRow:
+      type: object
+      properties:
+        category_slug:
+          type: string
+        category_title:
+          type: string
+        queued:
+          type: integer
+        running:
+          type: integer
+        ok:
+          type: integer
+        error:
+          type: integer
+        skipped:
+          type: integer
+        unsupported_source:
+          type: integer
+        failed_analyze:
+          type: integer
+        tenders_in_db:
+          type: integer
+
+    Tender:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        reg_number:
+          type: string
+        source_site:
+          type: string
+        law:
+          type: string
+        customer_id:
+          type: string
+          format: uuid
+          nullable: true
+        object_name:
+          type: string
+        status:
+          type: string
+        nmck:
+          type: number
+          nullable: true
+        currency:
+          type: string
+          example: RUB
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_on_site:
+          type: string
+          format: date-time
+          nullable: true
+        application_end:
+          type: string
+          format: date-time
+          nullable: true
+        analysis_status:
+          type: string
+          enum: [none, analyzed, delete, irrelevant, past, other]
+        payload:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        category_slugs:
+          type: array
+          items:
+            type: string
+        docs_total:
+          type: integer
+        docs_processed:
+          type: integer
+        docs_unprocessed:
+          type: integer
+        docs_with_text:
+          type: integer
+        docs_errors:
+          type: integer
+        collect_pct:
+          type: integer
+        collect_ok:
+          type: boolean
+          nullable: true
+        ai_pct:
+          type: integer
+        ai_ok:
+          type: boolean
+          nullable: true
+        ingest_status:
+          type: string
+        recommendation:
+          type: string
+        assess_score:
+          type: number
+          nullable: true
+        ready_for_ai:
+          type: boolean
+        card_tone:
+          type: string
+          enum: [good, bad, pending, neutral]
+
+    TenderDetail:
+      allOf:
+        - $ref: "#/components/schemas/Tender"
+        - type: object
+          properties:
+            customer:
+              $ref: "#/components/schemas/Customer"
+
+    PatchTenderRequest:
+      type: object
+      properties:
+        object_name:
+          type: string
+        status:
+          type: string
+        analysis_status:
+          type: string
+          enum: [none, analyzed, delete, irrelevant, past, other]
+        nmck:
+          type: number
+
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tender_id:
+          type: string
+          format: uuid
+        uid:
+          type: string
+        filename:
+          type: string
+        source_url:
+          type: string
+        group_title:
+          type: string
+        edition:
+          type: string
+        process_status:
+          type: string
+          enum: [processed, unprocessed]
+        text_content:
+          type: string
+          nullable: true
+        process_error:
+          type: string
+        content_hash:
+          type: string
+        removed:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TenderEvent:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tender_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+
+    Assessment:
+      type: object
+      properties:
+        tender_id:
+          type: string
+          format: uuid
+        summary:
+          type: string
+        score:
+          type: number
+          nullable: true
+        details:
+          type: object
+          additionalProperties: true
+        updated_at:
+          type: string
+          format: date-time
+
+    AssessmentInput:
+      type: object
+      properties:
+        summary:
+          type: string
+        score:
+          type: number
+          nullable: true
+        details:
+          type: object
+          additionalProperties: true
+
+    AnalyzeRequest:
+      type: object
+      properties:
+        checklist_id:
+          type: string
+        config_id:
+          type: string
+          description: ID AI-конфига (опционально)
+
+    WorkersStatus:
+      type: object
+      properties:
+        ingest:
+          type: string
+          enum: [running, paused, stopped]
+        auto_ai:
+          type: boolean
+        analyze_active:
+          type: boolean
+        analyze_running:
+          type: integer
+        analyze_capacity:
+          type: integer
+        analizator_configured:
+          type: boolean
+        analizator:
+          type: string
+          description: ok | disabled
+
+    WorkersStatusStop:
+      allOf:
+        - $ref: "#/components/schemas/WorkersStatus"
+        - type: object
+          properties:
+            cancelled_items:
+              type: integer
+            cancelled_jobs:
+              type: integer
+
+    SetAutoAIRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        auto_ai:
+          type: boolean
+      description: Нужно одно из полей `enabled` или `auto_ai`
+
+    Customer:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        inn:
+          type: string
+        kpp:
+          type: string
+        ogrn:
+          type: string
+        full_name:
+          type: string
+        short_name:
+          type: string
+        address:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+        contact_person:
+          type: string
+        organization_code:
+          type: string
+        agency_id:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CustomerInput:
+      type: object
+      properties:
+        inn:
+          type: string
+        kpp:
+          type: string
+        ogrn:
+          type: string
+        full_name:
+          type: string
+        short_name:
+          type: string
+        address:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+        contact_person:
+          type: string
+        organization_code:
+          type: string
+        agency_id:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true

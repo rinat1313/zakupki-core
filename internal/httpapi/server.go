@@ -31,6 +31,7 @@ func New(st *store.Store, az *analizator.Client, ctrl *control.Controller) *Serv
 	}
 	s := &Server{Store: st, Analizator: az, Control: ctrl, Mux: http.NewServeMux()}
 	s.routes()
+	s.registerSwagger()
 	return s
 }
 
